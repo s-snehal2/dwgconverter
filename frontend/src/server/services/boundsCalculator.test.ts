@@ -76,6 +76,23 @@ describe("entityBounds", () => {
     expect(box).toEqual({ minX: 5, minY: 10, maxX: 40, maxY: 30 });
   });
 
+  it("bounds an image by its placement corners", () => {
+    const box = entityBounds({
+      type: "IMAGE",
+      vertices: [
+        { x: 5, y: 10 },
+        { x: 40, y: 10 },
+        { x: 40, y: 30 },
+        { x: 5, y: 30 },
+      ],
+      color: "#000000",
+      layer: "0",
+      lineWeight: 25,
+      sourceType: "IMAGE",
+    });
+    expect(box).toEqual({ minX: 5, minY: 10, maxX: 40, maxY: 30 });
+  });
+
   it("bounds a full horizontal ellipse by both the major and minor radii", () => {
     const box = entityBounds({
       type: "ELLIPSE",

@@ -16,6 +16,7 @@ import {
   Face3D,
   Hatch,
   Leader,
+  RasterImage,
   LayerFlags,
 } from "@node-projects/acad-ts";
 import type { CadPoint, Entity as ModelsEntity, TextAlignment } from "../models/entity";
@@ -28,6 +29,60 @@ import type { CadPoint, Entity as ModelsEntity, TextAlignment } from "../models/
 
 function point(p: { x: number; y: number; z?: number }): CadPoint {
   return { x: p.x, y: p.y, z: p.z };
+}
+
+/**
+ * Strip MText inline-formatting codes into plain text. Mirrors acad-ts's
+ * TextProcessor.parse but without its infinite-loop bug: acad-ts resets the
+ * scan index to 0 when an escape code (`\f`, `\c`, `\h`, `\p`, `\A`, ...) is
+ * not terminated by a `;`, which hangs forever on real-world MText strings.
+ * This variant always advances, dropping the code and, when present, its
+ * `;`-terminated payload. Escaped braces/backslashes and `\P`/`\n` line
+ * breaks are preserved; group braces `{`/`}` are dropped.
+ */
+function mtextPlainText(value: string): string {
+  let sb = "";
+  let index = 0;
+  while (index < value.length) {
+    const current = value[index];
+    const next = index + 1 < value.length ? value[index + 1] : undefined;
+    if (current === "\\" && next !== undefined) {
+      switch (next) {
+        case "}":
+        case "{":
+        case "\\":
+          sb += next;
+          index += 2;
+          break;
+        case "A":
+        case "c":
+        case "C":
+        case "f":
+        case "F":
+        case "h":
+        case "H":
+        case "p": {
+          const semi = value.indexOf(";", index);
+          index = semi === -1 ? value.length : semi + 1;
+          break;
+        }
+        case "P":
+        case "n":
+          sb += "\n";
+          index += 2;
+          break;
+        default:
+          index += 1;
+          break;
+      }
+    } else if ((current === "{" || current === "}") && next !== "\\" && (index === 0 || value[index - 1] !== "\\")) {
+      index += 1;
+    } else {
+      sb += current;
+      index += 1;
+    }
+  }
+  return sb;
 }
 
 /** Resolve the effective color to a CSS hex string; white strokes become black. */
@@ -133,6 +188,34 @@ function solidVertices(points: Array<{ x: number; y: number }>): CadPoint[] {
       continue;
     }
     vertices.push({ x: p.x, y: p.y });
+  }
+  return vertices;
+}
+
+/**
+ * The placement quadrilateral of a raster IMAGE: the insertion point plus the
+ * u/v axis vectors give its four corners. Consecutive duplicates are dropped
+ * and only finite coordinates are kept.
+ */
+function rasterImageVertices(image: RasterImage): CadPoint[] {
+  const insert = image.insertPoint;
+  const u = image.uVector;
+  const v = image.vVector;
+  const candidates = [
+    { x: insert.x, y: insert.y },
+    { x: insert.x + u.x, y: insert.y + u.y },
+    { x: insert.x + u.x + v.x, y: insert.y + u.y + v.y },
+    { x: insert.x + v.x, y: insert.y + v.y },
+  ];
+  const vertices: CadPoint[] = [];
+  for (const p of candidates) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+      continue;
+    }
+    const last = vertices[vertices.length - 1];
+    if (!last || Math.abs(last.x - p.x) > 1e-9 || Math.abs(last.y - p.y) > 1e-9) {
+      vertices.push(p);
+    }
   }
   return vertices;
 }
@@ -341,9 +424,9 @@ export function extractEntity(entity: Entity): ModelsEntity | null {
       position: point(entity.insertPoint),
       rotation: entity.rotation,
       height: entity.height,
-      text: entity.plainText ?? entity.value ?? "",
+      text: mtextPlainText(entity.value ?? ""),
       width: entity.rectangleWidth,
-      alignment: textAlignment(entity, entity.plainText ?? "", entity.height),
+      alignment: textAlignment(entity, entity.value ?? "", entity.height),
     };
   }
   if (entity instanceof Spline) {
@@ -362,6 +445,15 @@ export function extractEntity(entity: Entity): ModelsEntity | null {
       return null;
     }
     return { ...baseProps(entity, "SOLID"), vertices, filled: false };
+  }
+  if (entity instanceof RasterImage) {
+    // The DWG references an external image file whose pixels are not part of
+    // the drawing, so the image is normalized to its placement frame.
+    const vertices = rasterImageVertices(entity);
+    if (vertices.length < 3) {
+      return null;
+    }
+    return { ...baseProps(entity, "IMAGE"), vertices };
   }
   return null;
 }

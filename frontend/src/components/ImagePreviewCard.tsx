@@ -1,12 +1,16 @@
 "use client";
 
-import { Download, Expand } from "lucide-react";
+import { Download, Expand, Check } from "lucide-react";
 import { cn } from "cn";
 
 interface ImagePreviewCardProps {
   src: string;
   alt: string;
   imageClassName?: string;
+  /** Renders this card as the chosen sheet (primary ring + badge). */
+  selected?: boolean;
+  /** Marks this sheet as selected when set on the card. */
+  onSelect?: () => void;
   onToggleBig: () => void;
   onDownload: () => void;
 }
@@ -15,14 +19,31 @@ export default function ImagePreviewCard({
   src,
   alt,
   imageClassName,
+  selected = false,
+  onSelect,
   onToggleBig,
   onDownload,
 }: ImagePreviewCardProps) {
+  const handlePreviewClick = () => {
+    if (onSelect) {
+      onSelect();
+      return;
+    }
+    onToggleBig();
+  };
+
   return (
-    <div className="group relative overflow-hidden rounded-xl border border-border/70 bg-white shadow-sm transition-shadow duration-300 hover:shadow-lg">
+    <div
+      className={cn(
+        "group relative overflow-hidden rounded-xl border bg-white shadow-sm transition-shadow duration-300 hover:shadow-lg",
+        selected
+          ? "border-primary ring-2 ring-primary/50"
+          : "border-border/70 ring-0"
+      )}
+    >
       <button
         type="button"
-        onClick={onToggleBig}
+        onClick={handlePreviewClick}
         aria-label={`View ${alt} larger`}
         className="block w-full cursor-zoom-in"
       >
@@ -37,6 +58,13 @@ export default function ImagePreviewCard({
         />
         <span className="pointer-events-none absolute inset-0 rounded-xl ring-1 ring-inset ring-foreground/0 transition group-hover:ring-foreground/10" />
       </button>
+
+      {selected && (
+        <span className="pointer-events-none absolute top-2.5 left-2.5 flex items-center gap-1 rounded-full bg-primary px-2.5 py-1 text-[11px] font-semibold text-white shadow-md">
+          <Check className="size-3" strokeWidth={3} />
+          Selected
+        </span>
+      )}
 
       <div className="absolute right-2.5 bottom-2.5 flex gap-1.5">
         <button

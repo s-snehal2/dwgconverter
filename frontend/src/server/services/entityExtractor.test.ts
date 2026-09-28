@@ -6,6 +6,7 @@ import {
   HatchBoundaryPathLine,
   LayerFlags,
   Leader,
+  RasterImage,
   Solid,
   Spline,
   XY,
@@ -100,6 +101,50 @@ describe("extractEntity for formerly-unsupported types", () => {
     face.fourthCorner = new XYZ(0, 10, 0);
     const normalized = extractEntity(face);
     expect(normalized).toMatchObject({ type: "SOLID", filled: false, sourceType: "3DFACE" });
+  });
+
+  it("maps a raster image to its placement quadrilateral", () => {
+    const image = new RasterImage();
+    image.insertPoint = new XYZ(0, 0, 0);
+    image.uVector = new XYZ(10, 0, 0);
+    image.vVector = new XYZ(0, 5, 0);
+    const normalized = extractEntity(image);
+    expect(normalized).toMatchObject({ type: "IMAGE", sourceType: "IMAGE" });
+    if (normalized?.type === "IMAGE") {
+      expect(normalized.vertices).toEqual([
+        { x: 0, y: 0 },
+        { x: 10, y: 0 },
+        { x: 10, y: 5 },
+        { x: 0, y: 5 },
+      ]);
+    }
+  });
+
+  it("maps a rotated image to its four corners", () => {
+    const image = new RasterImage();
+    image.insertPoint = new XYZ(0, 0, 0);
+    image.uVector = new XYZ(0, 10, 0);
+    image.vVector = new XYZ(-5, 0, 0);
+    const normalized = extractEntity(image);
+    expect(normalized).toBeDefined();
+    if (normalized?.type === "IMAGE") {
+      expect(normalized.vertices).toHaveLength(4);
+      expect(normalized.vertices.map((v) => [Math.round(v.x), Math.round(v.y)])).toEqual([
+        [0, 0],
+        [0, 10],
+        [-5, 10],
+        [-5, 0],
+      ]);
+    }
+  });
+
+  it("drops a raster image with no usable geometry", () => {
+    const image = new RasterImage();
+    image.insertPoint = new XYZ(0, 0, 0);
+    image.uVector = new XYZ(0, 0, 0);
+    image.vVector = new XYZ(0, 0, 0);
+    const normalized = extractEntity(image);
+    expect(normalized).toBeNull();
   });
 });
 

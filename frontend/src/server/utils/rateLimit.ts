@@ -27,3 +27,12 @@ export function takeRateLimit(ip: string, maxRequests: number, windowMs: number)
 export function clearRateLimits(): void {
   windows.clear();
 }
+
+/** Best-effort caller IP from proxy headers, falling back to a shared bucket. */
+export function clientIpFrom(headers: Headers): string {
+  const forwarded = headers.get("x-forwarded-for");
+  if (forwarded) {
+    return forwarded.split(",")[0]?.trim() ?? "unknown";
+  }
+  return headers.get("x-real-ip") ?? "local";
+}

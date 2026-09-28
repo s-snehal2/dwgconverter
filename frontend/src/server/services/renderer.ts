@@ -54,6 +54,88 @@ interface RenderContext {
   bounds: Drawing["bounds"];
 }
 
+/** Axis-aligned bounding box in model coordinates. */
+interface ModelAabb {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+/**
+ * Conservative per-entity bounds in model coordinates, cached per entity array.
+ * Every paper-space sheet projects the same model-space array, so the AABBs are
+ * computed once and reused across all sheets for viewport-window culling.
+ */
+const entityBoundsCache = new WeakMap<Entity[], Array<ModelAabb | null>>();
+
+function entityModelBounds(entity: Entity): ModelAabb | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  const add = (p: { x: number; y: number; z?: number }): void => {
+    if (Number.isFinite(p.x)) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+    }
+    if (Number.isFinite(p.y)) {
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+  };
+  switch (entity.type) {
+    case "POLYLINE":
+    case "SOLID":
+    case "IMAGE":
+      for (const v of entity.vertices) {
+        add(v);
+      }
+      break;
+    case "LINE":
+      add(entity.start);
+      add(entity.end);
+      break;
+    case "CIRCLE":
+      add({ x: entity.center.x - entity.radius, y: entity.center.y - entity.radius });
+      add({ x: entity.center.x + entity.radius, y: entity.center.y + entity.radius });
+      break;
+    case "ARC":
+      add({ x: entity.center.x - entity.radius, y: entity.center.y - entity.radius });
+      add({ x: entity.center.x + entity.radius, y: entity.center.y + entity.radius });
+      break;
+    case "ELLIPSE": {
+      const r = Math.max(1e-9, Math.hypot(entity.majorAxisEndPoint.x ?? 0, entity.majorAxisEndPoint.y ?? 0));
+      add({ x: entity.center.x - r, y: entity.center.y - r });
+      add({ x: entity.center.x + r, y: entity.center.y + r });
+      break;
+    }
+    case "POINT":
+    case "TEXT":
+    case "MTEXT":
+      add(entity.position);
+      break;
+  }
+  if (!Number.isFinite(minX)) {
+    return null;
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function modelBoundsFor(entities: Entity[]): Array<ModelAabb | null> {
+  const cached = entityBoundsCache.get(entities);
+  if (cached) {
+    return cached;
+  }
+  const bounds = entities.map(entityModelBounds);
+  entityBoundsCache.set(entities, bounds);
+  return bounds;
+}
+
+function intersectsWindow(b: ModelAabb, x0: number, y0: number, x1: number, y1: number): boolean {
+  return b.maxX >= x0 && b.minX <= x1 && b.maxY >= y0 && b.minY <= y1;
+}
+
 /**
  * Renderer — the only consumer of the normalized Drawing model. Produces a
  * plain SVG in final pixel coordinates (Y inverted, margins applied, monochrome
@@ -168,6 +250,20 @@ function renderPageToSvg(drawing: Drawing, options: RenderOptions): string {
       );
       return;
     }
+    // Only project model entities whose bounds overlap this viewport's model
+    // window: layouts frame a subset in pixel space, and clipping away the
+    // rest of a huge model keeps the SVG compact. Rotated (twisted) viewports
+    // are excluded to stay conservative.
+    const windowRect =
+      viewport.twist === 0 && viewport.viewWidth > 0 && viewport.viewHeight > 0
+        ? {
+            x0: viewport.viewCenterX - viewport.viewWidth / 2,
+            y0: viewport.viewCenterY - viewport.viewHeight / 2,
+            x1: viewport.viewCenterX + viewport.viewWidth / 2,
+            y1: viewport.viewCenterY + viewport.viewHeight / 2,
+            bounds: modelBoundsFor(drawing.entities),
+          }
+        : null;
     parts.push(`<g clip-path="url(#vp-${index})">`);
     const modelInPage: Entity[] = [];
     for (let i = 0; i < drawing.entities.length; i++) {
@@ -180,6 +276,12 @@ function renderPageToSvg(drawing: Drawing, options: RenderOptions): string {
       }
       if (lite && LITE_SKIP_TYPES.has(entity.type)) {
         continue;
+      }
+      if (windowRect) {
+        const b = windowRect.bounds[i];
+        if (b && !intersectsWindow(b, windowRect.x0, windowRect.y0, windowRect.x1, windowRect.y1)) {
+          continue;
+        }
       }
       modelInPage.push(projectEntityToPage(entity, viewport));
     }
@@ -202,6 +304,7 @@ const ENTITY_PASSES: Array<Entity["type"]> = [
   "ARC",
   "ELLIPSE",
   "SOLID",
+  "IMAGE",
   "POINT",
   "TEXT",
   "MTEXT",
@@ -233,6 +336,8 @@ function renderEntity(ctx: RenderContext, entity: Entity): string[] {
       return [renderEllipse(ctx, entity)];
     case "SOLID":
       return [renderSolid(ctx, entity)];
+    case "IMAGE":
+      return [renderImage(ctx, entity)];
     case "POINT":
       return [renderPoint(ctx, entity)];
     case "TEXT":
@@ -443,6 +548,21 @@ function renderSolid(ctx: RenderContext, entity: Extract<Entity, { type: "SOLID"
   const color = strokeColor(ctx, entity);
   const fill = entity.filled ? color : "none";
   return `<polygon points="${points}" fill="${fill}" stroke="${color}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"/>`;
+}
+
+/** Light fill for RasterImage placeholder frames (the actual pixels are external to the DWG). */
+const IMAGE_PLACEHOLDER_FILL = "#e5e7eb";
+
+function renderImage(ctx: RenderContext, entity: Extract<Entity, { type: "IMAGE" }>): string {
+  if (entity.vertices.length < 3) {
+    return "";
+  }
+  const points = entity.vertices
+    .map((v) => px(v, ctx))
+    .map((p) => `${p.x},${p.y}`)
+    .join(" ");
+  const width = Math.max(1, ctx.minStrokePx);
+  return `<polygon points="${points}" fill="${IMAGE_PLACEHOLDER_FILL}" stroke="${strokeColor(ctx, entity)}" stroke-width="${width}" stroke-linejoin="round"/>`;
 }
 
 function renderText(ctx: RenderContext, entity: Extract<Entity, { type: "TEXT" | "MTEXT" }>): string {

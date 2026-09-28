@@ -20,11 +20,17 @@ const STATUS: Record<ProgressStep, string> = {
 
 interface ConversionProgressProps {
   step: ProgressStep;
+  /**
+   * Bytes sent to storage so far, 0–1. Only meaningful during the upload step;
+   * `null`/omitted means the platform reports no progress (multipart fallback).
+   */
+  uploadProgress?: number | null;
 }
 
 /** Three-step progress stepper shown while the DWG is being converted. */
-export default function ConversionProgress({ step }: ConversionProgressProps) {
+export default function ConversionProgress({ step, uploadProgress = null }: ConversionProgressProps) {
   const activeIndex = step === "done" ? 2 : step === "parse" || step === "render" ? 1 : 0;
+  const showUploadBar = step === "upload" && uploadProgress !== null;
 
   return (
     <div className="mt-6 animate-fade-in" role="status" aria-live="polite">
@@ -81,14 +87,23 @@ export default function ConversionProgress({ step }: ConversionProgressProps) {
       </ol>
 
       <div className="mt-4 h-1 w-full overflow-hidden rounded-full bg-muted">
-        {activeIndex === 1 ? (
+        {showUploadBar ? (
+          <div
+            className="h-full rounded-full bg-linear-to-r from-indigo-500 to-violet-500 transition-[width] duration-200"
+            style={{ width: `${Math.round(Math.min(1, Math.max(0, uploadProgress ?? 0)) * 100)}%` }}
+          />
+        ) : activeIndex === 1 ? (
           <div className="progress-indeterminate h-full rounded-full bg-linear-to-r from-indigo-500 to-violet-500" />
         ) : (
           <div className="h-full w-full rounded-full bg-linear-to-r from-indigo-500 to-violet-500" />
         )}
       </div>
 
-      <p className="mt-2 text-center text-[13px] font-medium text-muted-foreground">{STATUS[step]}</p>
+      <p className="mt-2 text-center text-[13px] font-medium text-muted-foreground">
+        {showUploadBar
+          ? `Uploading DWG… ${Math.round(Math.min(1, Math.max(0, uploadProgress ?? 0)) * 100)}%`
+          : STATUS[step]}
+      </p>
     </div>
   );
 }

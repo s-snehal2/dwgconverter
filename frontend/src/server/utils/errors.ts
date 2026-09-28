@@ -6,6 +6,7 @@ export type ErrorCode =
   | "INVALID_FILE"
   | "UNSUPPORTED_EXTENSION"
   | "FILE_TOO_LARGE"
+  | "CONVERSION_TIMEOUT"
   | "CORRUPTED_DWG"
   | "UNSUPPORTED_DWG_VERSION"
   | "MULTIPLE_LAYOUTS"
@@ -37,9 +38,10 @@ const USER_MESSAGES: Record<ErrorCode, string> = {
   INVALID_FILE: "The uploaded file could not be read.",
   UNSUPPORTED_EXTENSION: "Only DWG files are supported.",
   FILE_TOO_LARGE: "File size exceeds the allowed limit.",
+  CONVERSION_TIMEOUT: "This drawing is too complex to convert in time. Try a smaller file, or split it and convert one part at a time.",
   CORRUPTED_DWG: "Unable to read DWG file. It may be corrupted or password-protected.",
-  UNSUPPORTED_DWG_VERSION: "Unsupported DWG version. R14 (AC1014) and newer are supported.",
-  MULTIPLE_LAYOUTS: "This DWG contains more than one drawing. Only drawings with a single page are supported.",
+  UNSUPPORTED_DWG_VERSION: "Unsupported DWG version. R13 (AC1012) and newer are supported.",
+  MULTIPLE_LAYOUTS: "This DWG contains more layout sheets than this conversion supports. Raise MAX_LAYOUTS to allow more sheets.",
   PARSER_ERROR: "The DWG file could not be parsed.",
   RENDER_ERROR: "The drawing could not be rendered.",
   PNG_GENERATION_ERROR: "The PNG image could not be generated.",
@@ -65,6 +67,8 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "FILE_TOO_LARGE":
     case "RATE_LIMITED":
       return 400;
+    case "CONVERSION_TIMEOUT":
+      return 422;
     case "CORRUPTED_DWG":
     case "UNSUPPORTED_DWG_VERSION":
     case "MULTIPLE_LAYOUTS":

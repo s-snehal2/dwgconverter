@@ -1,16 +1,40 @@
+import { tmpdir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export interface AppConfig {
   maxFileSizeBytes: number;
+  /**
+   * Wall-clock budget for one conversion, in ms. The platform kills the
+   * function at `maxDuration` (300s) with an opaque 504 before any JavaScript
+   * can respond, so the budget is set below that and checked between stages to
+   * return a real error instead.
+   */
+  conversionBudgetMs: number;
   maxPngDimension: number;
   marginPx: number;
   /** Oversample factor for anti-aliasing (2 = render at 2x, downscale to fit). */
   pngSupersample: number;
   /** Minimum stroke thickness in pixels, so thin CAD lines stay visible. */
   minStrokePx: number;
-  /** Maximum number of paper-space layouts accepted; more layouts = rejection. */
+  /** Maximum number of paper-space layout sheets converted per DWG. */
   maxLayouts: number;
+  /**
+   * Rendered ink coverage below which a sheet is treated as blank and dropped
+   * instead of being emitted as a mostly-empty PNG. Measured by
+   * `rasterInkFraction`, so 0.005 means "less than half a percent of the page
+   * is covered in drawn lines".
+   */
+  blankSheetInkFraction: number;
+  /**
+   * Fraction of an axis span that must be empty before model space is cut into
+   * a separate per-drawing crop. Larger means fewer, bigger crops.
+   */
+  modelClusterGapFraction: number;
+  /** Recursion ceiling for model-space clustering. */
+  modelClusterMaxDepth: number;
+  /** Maximum length of a user-supplied AI image prompt, in characters. */
+  maxAiPromptChars: number;
   cleanupAgeMs: number;
   tempRootDir: string;
   uploadsDir: string;
@@ -36,6 +60,8 @@ export interface AppConfig {
   tilesviewAppKeyHeader: string;
   /** Header name for the TilesView app secret (default "app_secret"). */
   tilesviewAppSecretHeader: string;
+  /** Base URL of the TilesView visualizer app (without trailing slash). */
+  tilesviewVisualizerBaseUrl: string;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -49,8 +75,16 @@ function parsePositiveFloat(value: string | undefined, fallback: number): number
 }
 
 function resolveTempRoot(): string {
-  const root = process.env.TEMP_DIR ? resolve(process.env.TEMP_DIR) : join(process.cwd(), "temp");
-  return root;
+  if (process.env.TEMP_DIR) {
+    return resolve(process.env.TEMP_DIR);
+  }
+  // Serverless bundles run with cwd set to the read-only `/var/task`, so a
+  // `cwd/temp` default cannot be created there. Fall back to the OS temp dir
+  // instead, which is writable and writable-only-per-invocation on Vercel.
+  if (process.env.VERCEL) {
+    return tmpdir();
+  }
+  return join(process.cwd(), "temp");
 }
 
 /**
@@ -100,12 +134,17 @@ export function getConfig(): AppConfig {
   const uploadsDir = join(tempRootDir, "uploads");
   const outputsDir = join(tempRootDir, "outputs");
   return {
-    maxFileSizeBytes: parsePositiveInt(process.env.MAX_FILE_SIZE_MB, 50) * 1024 * 1024,
+    maxFileSizeBytes: parsePositiveInt(process.env.MAX_FILE_SIZE_MB, 80) * 1024 * 1024,
+    conversionBudgetMs: parsePositiveInt(process.env.CONVERSION_BUDGET_MS, 260_000),
     maxPngDimension: parsePositiveInt(process.env.MAX_PNG_DIMENSION, 3000),
     marginPx: parsePositiveInt(process.env.MARGIN_PX, 50),
     pngSupersample: parsePositiveInt(process.env.PNG_SUPERSAMPLE, 2),
     minStrokePx: parsePositiveFloat(process.env.MIN_STROKE_PX, 1),
-    maxLayouts: parsePositiveInt(process.env.MAX_LAYOUTS, 1),
+    maxLayouts: parsePositiveInt(process.env.MAX_LAYOUTS, 100),
+    blankSheetInkFraction: parsePositiveFloat(process.env.BLANK_SHEET_INK_FRACTION, 0.005),
+    modelClusterGapFraction: parsePositiveFloat(process.env.MODEL_CLUSTER_GAP_FRACTION, 0.03),
+    modelClusterMaxDepth: parsePositiveInt(process.env.MODEL_CLUSTER_MAX_DEPTH, 12),
+    maxAiPromptChars: parsePositiveInt(process.env.MAX_AI_PROMPT_CHARS, 1000),
     cleanupAgeMs: parsePositiveInt(process.env.CLEANUP_AGE_MINUTES, 1440) * 60 * 1000,
     tempRootDir,
     uploadsDir,
@@ -121,12 +160,28 @@ export function getConfig(): AppConfig {
     tilesviewAppSecret: (process.env.TILESVIEW_APP_SECRET ?? "").trim(),
     tilesviewAppKeyHeader: (process.env.TILESVIEW_APP_KEY_HEADER ?? "app_key").trim(),
     tilesviewAppSecretHeader: (process.env.TILESVIEW_APP_SECRET_HEADER ?? "app_secret").trim(),
+    tilesviewVisualizerBaseUrl: (
+      process.env.TILESVIEW_VISUALIZER_BASE_URL ?? "https://tilesview.ai/app/EZEnoscu4lODABbT_sHm7Q/visualizer"
+    ).trim().replace(/\/+$/, ""),
 
   };
 }
 
-/** Ensures the upload/output temp directories exist. */
+/**
+ * Ensures the upload/output temp directories exist.
+ *
+ * Best-effort by design: on Vercel the bundle directory is read-only, and the
+ * Blob-backed store does not need local files at all, so an unwritable temp
+ * root must not take the whole conversion down with an opaque 500.
+ */
 export function ensureTempDirs(config: AppConfig): void {
-  mkdirSync(config.uploadsDir, { recursive: true });
-  mkdirSync(config.outputsDir, { recursive: true });
+  for (const dir of [config.uploadsDir, config.outputsDir]) {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      console.warn(
+        `[config] could not create ${dir}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
 }

@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { getConfig } from "@/server/config";
 import { generateDrawingImage } from "@/server/services/geminiImage";
 import { sweepExpiredOutputs, readOutput, saveAiOutput, getAiGenerationCount, incrementAiGenerationCount } from "@/server/services/outputStore";
-import { toAppError, httpStatusForCode, userMessageForCode } from "@/server/utils/errors";
+import { toAppError, AppError, httpStatusForCode, userMessageForCode } from "@/server/utils/errors";
 import { isSafeConversionId } from "@/server/utils/storage";
 import { takeRateLimit } from "@/server/utils/rateLimit";
 
@@ -21,11 +21,29 @@ function log(message: string): void {
   console.info(`[generate] ${message}`);
 }
 
+/** User-supplied prompt from the JSON request body, validated + truncated. */
+async function readUserPrompt(request: NextRequest, maxChars: number): Promise<string | undefined> {
+  if (request.headers.get("content-type")?.includes("application/json")) {
+    const body = (await request.json().catch(() => null)) as { prompt?: unknown } | null;
+    const raw = typeof body?.prompt === "string" ? body.prompt : "";
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (trimmed.length > maxChars) {
+      throw new AppError("INVALID_FILE", `The AI prompt is too long (max ${maxChars} characters).`);
+    }
+    return trimmed;
+  }
+  return undefined;
+}
+
 /**
  * POST /api/generate/:id
- * Reads the already-converted DWG PNG and sends it to Gemini Nano Banana 2
- * with a static architectural visualization prompt.
- * Stores the generated AI image as outputs/{id}.ai.png.
+ * Reads the already-converted DWG sheet PNG and sends it to Gemini Nano
+ * Banana 2 with the architectural-visualization base prompt, optionally
+ * steered by a user-supplied `prompt` in the JSON body. Stores the generated
+ * AI image as outputs/{id}.ai.png.
  */
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -39,6 +57,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   if (!config.geminiApiKey) {
     log("Generate requested but GEMINI_API_KEY is not configured.");
     return errorResponse("AI_NOT_CONFIGURED");
+  }
+
+  let userPrompt: string | undefined;
+  try {
+    userPrompt = await readUserPrompt(request, config.maxAiPromptChars);
+  } catch (err) {
+    const appError = toAppError(err);
+    return Response.json(
+      { success: false, error: userMessageForCode(appError.code) },
+      { status: httpStatusForCode(appError.code) },
+    );
   }
 
   // Best-effort periodic cleanup of expired outputs.
@@ -70,7 +99,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const png = stored.buffer;
     log(`Sending ${id}.png (${png.byteLength} bytes) to Gemini for AI generation.`);
 
-    const { image, durationMs } = await generateDrawingImage(png, config);
+    const { image, durationMs } = await generateDrawingImage(png, config, userPrompt);
     log(`Gemini returned AI image (${image.byteLength} bytes) in ${durationMs}ms.`);
 
     const fileName = `${baseName}-ai.png`;

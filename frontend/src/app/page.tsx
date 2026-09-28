@@ -7,7 +7,7 @@ import type { ConversionResult as ConversionResultData } from "@/types/conversio
 import type { ProgressStep } from "@/components/ConversionProgress";
 import { convertDwgFile } from "@/services/api";
 
-const MAX_MB = 50;
+const MAX_MB = 80;
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
@@ -18,7 +18,9 @@ export default function Home() {
   const [converting, setConverting] = useState(false);
   const [step, setStep] = useState<ProgressStep>("upload");
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ConversionResultData | null>(null);
+  const [results, setResults] = useState<ConversionResultData[] | null>(null);
+  const [skippedBlankSheets, setSkippedBlankSheets] = useState<string[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const cancelInFlight = useCallback(() => {
@@ -30,7 +32,9 @@ export default function Home() {
     setConverting(false);
     setStep("upload");
     setError(null);
-    setResult(null);
+    setResults(null);
+    setSkippedBlankSheets([]);
+    setUploadProgress(null);
   }, []);
 
   const cancelConversion = useCallback(() => {
@@ -52,7 +56,7 @@ export default function Home() {
       cancelInFlight();
       setFile(candidate);
       setError(null);
-      setResult(null);
+      setResults(null);
       setStep("upload");
     },
     [cancelInFlight]
@@ -62,7 +66,7 @@ export default function Home() {
     cancelInFlight();
     setFile(null);
     setError(null);
-    setResult(null);
+    setResults(null);
     setStep("upload");
   }, [cancelInFlight]);
 
@@ -77,15 +81,30 @@ export default function Home() {
     abortRef.current = controller;
     setConverting(true);
     setError(null);
-    setResult(null);
-    setStep("parse");
+    setResults(null);
+    setStep("upload");
+    setUploadProgress(0);
 
     try {
-      const converted = await convertDwgFile(file, { signal: controller.signal });
+      const converted = await convertDwgFile(file, {
+        signal: controller.signal,
+        onUploadProgress: (fraction) => {
+          setUploadProgress(fraction);
+          if (fraction >= 1) {
+            setStep("parse");
+            setUploadProgress(null);
+          }
+        },
+      });
       setStep("render");
-      setResult(converted);
+      setResults(converted.sheets);
+      setSkippedBlankSheets(converted.skippedBlankSheets ?? []);
       setStep("done");
-      toast.success("Conversion complete. Your PNG is ready.");
+      toast.success(
+        converted.sheets.length > 1
+          ? `Conversion complete. ${converted.sheets.length} sheets are ready.`
+          : "Conversion complete. Your PNG is ready."
+      );
     } catch (err) {
       if (isAbortError(err)) {
         resetFromCancel();
@@ -94,9 +113,11 @@ export default function Home() {
       const message = err instanceof Error ? err.message : "Conversion failed.";
       setError(message);
       setStep("upload");
+      setUploadProgress(null);
       toast.error(message);
     } finally {
       setConverting(false);
+      setUploadProgress(null);
       if (abortRef.current === controller) {
         abortRef.current = null;
       }
@@ -109,8 +130,10 @@ export default function Home() {
         file={file}
         converting={converting}
         step={step}
+        uploadProgress={uploadProgress}
         error={error}
-        result={result}
+        results={results}
+        skippedBlankSheets={skippedBlankSheets}
         maxMb={MAX_MB}
         onFile={selectFile}
         onClear={clearFile}

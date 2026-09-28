@@ -146,6 +146,22 @@ describe("projectEntityToPage", () => {
     }
   });
 
+  it("maps an image's vertices through the viewport transform", () => {
+    const projected = projectEntityToPage(
+      { type: "IMAGE", vertices: [{ x: 50, y: 50 }, { x: 60, y: 50 }, { x: 60, y: 60 }, { x: 50, y: 60 }], color: "#000000", layer: "0", lineWeight: 25, sourceType: "IMAGE" },
+      VP
+    );
+    expect(projected.type).toBe("IMAGE");
+    if (projected.type === "IMAGE") {
+      expect(projected.vertices).toEqual([
+        { x: 200, y: 200 },
+        { x: 220, y: 200 },
+        { x: 220, y: 220 },
+        { x: 200, y: 220 },
+      ]);
+    }
+  });
+
   it("scales text height and adds the twist to text rotation", () => {
     const twisted: PageViewport = { ...VP, twist: Math.PI / 6 };
     const projected = projectEntityToPage(

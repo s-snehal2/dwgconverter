@@ -22,6 +22,13 @@ export function isBlobEnabled(): boolean {
 
 const BLOB_PREFIX = "outputs/";
 
+/**
+ * Prefix for in-flight DWG uploads. Kept here rather than beside its only
+ * consumer so this module never has to import `uploadStore` (which imports
+ * back for `isBlobEnabled`).
+ */
+export const UPLOAD_BLOB_PREFIX = "uploads/";
+
 function outputBlobPath(id: string): string {
   return `${BLOB_PREFIX}${id}.png`;
 }
@@ -194,20 +201,25 @@ export async function sweepExpiredOutputs(olderThanMs: number): Promise<number> 
 async function sweepExpiredBlobs(olderThanMs: number): Promise<number> {
   const now = Date.now();
   const expired: string[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await list({
-      prefix: BLOB_PREFIX,
-      limit: 1000,
-      ...(cursor ? { cursor } : {}),
-    });
-    for (const blob of page.blobs) {
-      if (now - blob.uploadedAt.getTime() > olderThanMs) {
-        expired.push(blob.url);
+  // Uploads live under their own prefix and are normally deleted as soon as a
+  // conversion finishes, but a crashed or timed-out conversion can leave one
+  // behind, so both prefixes are swept.
+  for (const prefix of [BLOB_PREFIX, UPLOAD_BLOB_PREFIX]) {
+    let cursor: string | undefined;
+    do {
+      const page = await list({
+        prefix,
+        limit: 1000,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const blob of page.blobs) {
+        if (now - blob.uploadedAt.getTime() > olderThanMs) {
+          expired.push(blob.url);
+        }
       }
-    }
-    cursor = page.hasMore ? page.cursor : undefined;
-  } while (cursor);
+      cursor = page.hasMore ? page.cursor : undefined;
+    } while (cursor);
+  }
   if (expired.length > 0) {
     await del(expired);
   }

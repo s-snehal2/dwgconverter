@@ -5,12 +5,17 @@ import type { AppConfig } from "../config";
 
 function baseConfig(): AppConfig {
   return {
-    maxFileSizeBytes: 50 * 1024 * 1024,
+    maxFileSizeBytes: 80 * 1024 * 1024,
+  conversionBudgetMs: 260_000,
     maxPngDimension: 3000,
     marginPx: 50,
     pngSupersample: 2,
     minStrokePx: 1,
-    maxLayouts: 1,
+    modelClusterGapFraction: 0.03,
+    modelClusterMaxDepth: 12,
+    maxLayouts: 100,
+    blankSheetInkFraction: 0.005,
+    maxAiPromptChars: 1000,
     cleanupAgeMs: 24 * 60 * 60 * 1000,
     tempRootDir: "/tmp",
     uploadsDir: "/tmp/uploads",
@@ -26,6 +31,7 @@ function baseConfig(): AppConfig {
     tilesviewAppSecret: "s",
     tilesviewAppKeyHeader: "app_key",
     tilesviewAppSecretHeader: "app_secret",
+    tilesviewVisualizerBaseUrl: "https://tilesview.ai/app/EZEnoscu4lODABbT_sHm7Q/visualizer",
   };
 }
 

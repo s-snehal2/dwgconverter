@@ -1,14 +1,15 @@
 import { AppError } from "./errors";
 
-/** Supported DWG signature versions (R14 through AutoCAD 2018). */
+/** Supported DWG signature versions (R13 through AutoCAD 2018 and newer). */
 const SUPPORTED_DWG_VERSIONS = new Set([
+  "AC1012", // R13
   "AC1014", // R14
   "AC1015", // 2000
   "AC1018", // 2004
   "AC1021", // 2007
   "AC1024", // 2010
   "AC1027", // 2013
-  "AC1032", // 2018
+  "AC1032", // 2018 (also 2019-2027; the format has not changed since)
 ]);
 
 export interface ValidationResultOk {
@@ -63,7 +64,7 @@ export function validateDwgSignature(head: Uint8Array): ValidationResult {
         ok: false,
         error: new AppError(
           "UNSUPPORTED_DWG_VERSION",
-          `Unsupported DWG version "${version}". R14 (AC1014) and newer are supported.`
+          `Unsupported DWG version "${version}". R13 (AC1012) and newer are supported.`
         ),
       };
     }

@@ -84,6 +84,9 @@ export function projectEntityToPage(entity: Entity, vp: PageViewport): Entity {
     case "SOLID": {
       return { ...entity, vertices: entity.vertices.map((v) => modelToPagePoint(vp, v.x, v.y)) };
     }
+    case "IMAGE": {
+      return { ...entity, vertices: entity.vertices.map((v) => modelToPagePoint(vp, v.x, v.y)) };
+    }
     case "TEXT":
     case "MTEXT": {
       return {

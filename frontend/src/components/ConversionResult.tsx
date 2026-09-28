@@ -3,29 +3,45 @@
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
 
-import { downloadUrl, generateAiImage, aiDownloadUrl, sendToTilesview } from "@/services/api";
+import {
+  downloadUrl,
+  generateAiImage,
+  aiDownloadUrl,
+  sendToTilesview,
+} from "@/services/api";
 
-import { Check, RotateCcw, Sparkles, Loader2, Download, MonitorSmartphone } from "lucide-react";
+import {
+  Check,
+  Loader2,
+  MonitorSmartphone,
+  MousePointerClick,
+  Sparkles,
+  LayoutGrid,
+} from "lucide-react";
 import type { ConversionResult as ConversionResultData } from "@/types/conversion";
 
+import { cn } from "cn";
 import { Button } from "@/components/ui/button";
 import ImagePreviewCard from "@/components/ImagePreviewCard";
 import ImageLightbox from "@/components/ImageLightbox";
 
-
 interface ConversionResultProps {
-  result: ConversionResultData;
+  results: ConversionResultData[];
+  skippedBlankSheets?: string[];
   onReset: () => void;
 }
 
-export default function ConversionResult({ result, onReset }: ConversionResultProps) {
-  const [downloadingPng, setDownloadingPng] = useState(false);
-  const [downloadingAi, setDownloadingAi] = useState(false);
+export default function ConversionResult({ results, skippedBlankSheets = [], onReset }: ConversionResultProps) {
+  const [selectedId, setSelectedId] = useState<string | null>(results[0]?.conversionId ?? null);
   const [generating, setGenerating] = useState(false);
-  const [aiDone, setAiDone] = useState(false);
-  const [aiUsage, setAiUsage] = useState<{ used: number; limit: number } | null>(null);
-  const [lightbox, setLightbox] = useState<"png" | "ai" | null>(null);
+  const [downloadingAi, setDownloadingAi] = useState(false);
   const [sendingToTilesview, setSendingToTilesview] = useState(false);
+  const [generatedAi, setGeneratedAi] = useState<Record<string, boolean>>({});
+  const [aiUsageById, setAiUsageById] = useState<Record<string, { used: number; limit: number }>>({});
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<{ kind: "png" | "ai"; id: string } | null>(null);
+
+  const selected = results.find((result) => result.conversionId === selectedId) ?? results[0] ?? null;
 
   const downloadImageFile = useCallback(
     async (url: string, fileName: string, notAvailable: string) => {
@@ -46,31 +62,38 @@ export default function ConversionResult({ result, onReset }: ConversionResultPr
     []
   );
 
-  const handleDownload = useCallback(async () => {
-    if (downloadingPng) return;
-    setDownloadingPng(true);
-    try {
-      await downloadImageFile(
-        downloadUrl(result.conversionId),
-        result.fileName,
-        "Your converted file is no longer available on this server."
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "The PNG could not be downloaded.";
-      toast.error(message);
-    } finally {
-      setDownloadingPng(false);
-    }
-  }, [downloadingPng, downloadImageFile, result.conversionId, result.fileName]);
+  const handleDownload = useCallback(
+    async (result: ConversionResultData) => {
+      if (downloadingId) return;
+      setDownloadingId(result.conversionId);
+      try {
+        await downloadImageFile(
+          downloadUrl(result.conversionId),
+          result.fileName,
+          "Your converted file is no longer available on this server."
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "The PNG could not be downloaded.";
+        toast.error(message);
+      } finally {
+        setDownloadingId(null);
+      }
+    },
+    [downloadingId, downloadImageFile]
+  );
+
+  const handleSelect = useCallback((result: ConversionResultData) => {
+    setSelectedId(result.conversionId);
+  }, []);
 
   const handleGenerate = useCallback(async () => {
-    if (generating) return;
+    if (!selected || generating) return;
     setGenerating(true);
-    setAiDone(false);
+    const id = selected.conversionId;
     try {
-      const res = await generateAiImage(result.conversionId);
-      setAiUsage({ used: res.generationsUsed, limit: res.generationsLimit });
-      setAiDone(true);
+      const res = await generateAiImage(id);
+      setAiUsageById((prev) => ({ ...prev, [id]: { used: res.generationsUsed, limit: res.generationsLimit } }));
+      setGeneratedAi((prev) => ({ ...prev, [id]: true }));
       toast.success("AI image generated successfully.");
     } catch (err) {
       const message = err instanceof Error ? err.message : "AI generation failed.";
@@ -78,29 +101,40 @@ export default function ConversionResult({ result, onReset }: ConversionResultPr
     } finally {
       setGenerating(false);
     }
-  }, [generating, result.conversionId]);
+  }, [generating, selected]);
+
   const handleTilesview = useCallback(async () => {
-    if (sendingToTilesview) return;
+    if (!selected || sendingToTilesview) return;
     setSendingToTilesview(true);
+    // Pre-open the tab synchronously inside the click handler so the browser
+    // cannot block it as a popup (user activation often expires during the
+    // async upload step), then point it at the visualizer once the upload
+    // succeeds. The app tab stays open.
+    const opener = window.open("", "_blank");
     try {
-      const res = await sendToTilesview(result.conversionId);
-      toast.success(`Sent to TilesView. Room ID: ${res.customRoomsId}`);
-      window.location.href = `https://tilesview.ai/app/EZEnoscu4lODABbT_sHm7Q/visualizer/${res.customRoomsId}/MySpace`;
+      const res = await sendToTilesview(selected.conversionId);
+      toast.success(`Sent to TilesView. Room ID: ${res.customRoomsId}. Opened in a new tab.`);
+      if (opener && !opener.closed) {
+        opener.location.href = res.visualizerUrl;
+      } else {
+        window.open(res.visualizerUrl, "_blank", "noopener,noreferrer");
+      }
     } catch (err) {
+      opener?.close();
       const message = err instanceof Error ? err.message : "Sending to TilesView failed.";
       toast.error(message);
     } finally {
       setSendingToTilesview(false);
     }
-  }, [sendingToTilesview, result.conversionId]);
+  }, [selected, sendingToTilesview]);
 
   const handleAiDownload = useCallback(async () => {
-    if (downloadingAi) return;
+    if (!selected || downloadingAi) return;
     setDownloadingAi(true);
     try {
       await downloadImageFile(
-        aiDownloadUrl(result.conversionId),
-        `${result.fileName.replace(/\.png$/i, "")}-ai.png`,
+        aiDownloadUrl(selected.conversionId),
+        `${selected.fileName.replace(/\.png$/i, "")}-ai.png`,
         "The AI image is no longer available on this server."
       );
     } catch (err) {
@@ -109,21 +143,32 @@ export default function ConversionResult({ result, onReset }: ConversionResultPr
     } finally {
       setDownloadingAi(false);
     }
-  }, [downloadingAi, downloadImageFile, result.conversionId, result.fileName]);
+  }, [downloadingAi, downloadImageFile, selected]);
 
-  const lightboxSrc =
-    lightbox === "ai"
-      ? aiDownloadUrl(result.conversionId)
-      : lightbox === "png"
-        ? downloadUrl(result.conversionId)
-        : null;
+  const selectedAiDone = selected ? Boolean(generatedAi[selected.conversionId]) : false;
+  const selectedAiUsage = selected ? aiUsageById[selected.conversionId] : undefined;
 
-  const warnings = Array.from(new Set(result.warnings ?? []));
-  const skipped = result.statistics?.skippedEntities ?? 0;
+  const lightboxResult = lightbox
+    ? results.find((r) => r.conversionId === lightbox.id) ?? null
+    : null;
+  const lightboxSrc = lightbox
+    ? lightbox.kind === "ai"
+      ? aiDownloadUrl(lightbox.id)
+      : downloadUrl(lightbox.id)
+    : null;
+  const lightboxTitle = lightbox?.kind === "ai" ? "AI Image" : "Converted PNG";
+  const lightboxSubtitle = lightboxResult
+    ? lightbox?.kind === "ai"
+      ? `${lightboxResult.fileName.replace(/\.png$/i, "")}-ai.png`
+      : lightboxResult.fileName
+    : "";
+
+  const selectedWarnings = selected ? Array.from(new Set(selected.warnings ?? [])) : [];
+  const selectedSkipped = selected?.statistics?.skippedEntities ?? 0;
   const warningsHeadline =
-    skipped > 0
-      ? `${skipped} unsupported ${skipped === 1 ? "entity was" : "entities were"} skipped.`
-      : `${warnings.length} ${warnings.length === 1 ? "warning was" : "warnings were"} generated during conversion.`;
+    selectedSkipped > 0
+      ? `${selectedSkipped} unsupported ${selectedSkipped === 1 ? "entity was" : "entities were"} skipped.`
+      : `${selectedWarnings.length} ${selectedWarnings.length === 1 ? "warning was" : "warnings were"} generated during conversion.`;
 
   return (
     <div className="mt-5 animate-slide-up space-y-4">
@@ -132,55 +177,88 @@ export default function ConversionResult({ result, onReset }: ConversionResultPr
           <Check className="size-4" strokeWidth={2.25} />
         </span>
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-foreground">Your PNG is ready</p>
-          <p className="truncate text-[13px] text-muted-foreground">
-            {result.fileName}
-            {result.size ? ` · ${(result.size / (1024 * 1024)).toFixed(2)} MB` : ""}
+          <p className="text-sm font-semibold text-foreground">
+            {results.length > 1
+              ? `${results.length} sheets converted`
+              : "Your PNG is ready"}
           </p>
+          <p className="truncate text-[13px] text-muted-foreground">
+            {results[0]?.originalFileName} · click a sheet to view it, then generate its AI visualization
+          </p>
+          {skippedBlankSheets.length > 0 && (
+            <p className="text-[12px] font-medium text-amber-600 dark:text-amber-400">
+              {skippedBlankSheets.length} blank sheet{skippedBlankSheets.length === 1 ? " was" : "s were"}{" "}
+              omitted: {skippedBlankSheets.slice(0, 3).join(", ")}
+              {skippedBlankSheets.length > 3 ? "…" : ""}.
+            </p>
+          )}
         </div>
       </div>
 
-      <div className="mx-auto w-full max-w-xl space-y-1.5">
-        <ImagePreviewCard
-          src={downloadUrl(result.conversionId)}
-          alt={`Converted PNG: ${result.fileName}`}
-          onToggleBig={() => setLightbox("png")}
-          onDownload={handleDownload}
-        />
-        <p className="truncate px-1 text-center text-xs font-medium text-muted-foreground">{result.fileName}</p>
+      <div className="mb-3 flex items-center gap-2">
+        <span className="text-xs font-semibold tracking-[0.12em] text-muted-foreground uppercase">
+          Sheets
+        </span>
+        <span className="h-px flex-1 bg-border/60" />
       </div>
 
-      <div className="flex flex-row gap-3">
-        <Button
-          size="lg"
-          className="h-11 flex-1 rounded-xl bg-linear-to-r from-indigo-500 to-violet-500 text-sm font-semibold text-white shadow-lg shadow-indigo-500/30 transition-all hover:from-indigo-500 hover:to-violet-600 hover:shadow-indigo-500/40 disabled:from-indigo-500/60 disabled:to-violet-500/60"
-          onClick={handleDownload}
-          disabled={downloadingPng}
-        >
-          {downloadingPng ? <Loader2 className="animate-spin" /> : <Download />}
-          {downloadingPng ? "Downloading…" : "Download PNG"}
-        </Button>
-        <Button variant="outline" className="h-11 flex-1 rounded-xl text-sm sm:flex-none sm:px-6" onClick={onReset}>
-          <RotateCcw />
-          Convert another
-        </Button>
-      </div>
+      <div className="grid grid-cols-1 gap-4 items-start sm:grid-cols-2 xl:grid-cols-3">
+        {results.map((result, index) => {
+          const isSelected = result.conversionId === selected?.conversionId;
+          const aiDone = Boolean(generatedAi[result.conversionId]);
+          const skipped = result.statistics?.skippedEntities ?? 0;
+          const warnings = Array.from(new Set(result.warnings ?? []));
+          return (
+            <div
+              key={result.conversionId}
+              className={cn(
+                "flex min-w-0 flex-col rounded-2xl border bg-card/50 p-3 transition-colors",
+                isSelected ? "border-primary/40 bg-primary/[0.04]" : "border-border/60"
+              )}
+            >
+              <div className="mb-2 flex min-w-0 items-center gap-2 px-1">
+                <p className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
+                  {result.sheetName ?? `Sheet ${index + 1}`}
+                </p>
+                {aiDone && (
+                  <span className="flex shrink-0 items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                    <Sparkles className="size-3" />
+                    AI ready
+                  </span>
+                )}
+              </div>
+              <p className="mb-2 min-w-0 truncate px-1 text-[12px] text-muted-foreground">
+                {result.fileName}
+                {result.size ? ` · ${(result.size / (1024 * 1024)).toFixed(2)} MB` : ""}
+                {skipped > 0 ? ` · ${skipped} skipped` : ""}
+                {warnings.length > 0 ? ` · ${warnings.length} warning(s)` : ""}
+              </p>
 
-      {warnings.length > 0 && (
-        <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.07] px-3.5 py-2.5 text-xs text-amber-700 dark:text-amber-400">
-          <p className="font-medium">{warningsHeadline}</p>
-          <details className="mt-1.5">
-            <summary className="cursor-pointer list-none font-medium underline decoration-dotted underline-offset-4">
-              Details ({warnings.length})
-            </summary>
-            <ul className="mt-1.5 list-inside list-disc space-y-0.5">
-              {warnings.map((warning) => (
-                <li key={warning}>{warning}</li>
-              ))}
-            </ul>
-          </details>
-        </div>
-      )}
+              <ImagePreviewCard
+                src={downloadUrl(result.conversionId)}
+                alt={`Converted PNG: ${result.fileName}`}
+                imageClassName="h-56"
+                selected={isSelected}
+                onSelect={() => setLightbox({ kind: "png", id: result.conversionId })}
+                onToggleBig={() => setLightbox({ kind: "png", id: result.conversionId })}
+                onDownload={() => handleDownload(result)}
+              />
+
+<div className="mt-2 flex flex-wrap items-center justify-between gap-2 px-1">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-9 rounded-xl text-xs font-semibold"
+                    onClick={() => handleSelect(result)}
+                  >
+                    <MousePointerClick className="size-3.5" />
+                    {isSelected ? "Selected" : "Select for AI"}
+                  </Button>
+                </div>
+            </div>
+          );
+        })}
+      </div>
 
       <div className="border-t border-border/40 pt-4">
         <div className="mb-3 flex items-center gap-2">
@@ -191,72 +269,105 @@ export default function ConversionResult({ result, onReset }: ConversionResultPr
         </div>
 
         <div className="space-y-2.5">
-          <Button
-            className="h-10 w-full rounded-xl bg-linear-to-r from-amber-500 to-orange-500 text-sm font-semibold text-white shadow-md shadow-amber-500/25 transition-all hover:from-amber-500 hover:to-orange-600 hover:shadow-amber-500/35 disabled:from-amber-500/60 disabled:to-orange-500/60"
-            onClick={handleGenerate}
-            disabled={generating}
-          >
-            {generating ? (
-              <>
-                <Loader2 className="animate-spin" />
-                Generating AI image…
-              </>
-            ) : (
-              <>
-                <Sparkles />
-                Generate AI image
-                {aiUsage ? ` (${aiUsage.used}/${aiUsage.limit})` : ""}
-              </>
-            )}
-          </Button>
-
-          {aiUsage && aiUsage.used >= aiUsage.limit && (
-            <p className="px-1 text-center text-xs text-muted-foreground">
-              Generation limit reached ({aiUsage.limit}/{aiUsage.limit}). Convert the DWG again to
-              generate more.
+          {!selected ? (
+            <p className="px-1 text-center text-sm text-muted-foreground">
+              No sheet selected.
             </p>
-          )}
-
-          {aiDone && (
-            <div className="animate-slide-up">
-              <ImagePreviewCard
-                src={aiDownloadUrl(result.conversionId)}
-                alt={`AI visualization: ${result.fileName}`}
-                onToggleBig={() => setLightbox("ai")}
-                onDownload={handleAiDownload}
-              />
-             <div className="flex flex-row gap-3 mt-3">
-                <Button
-                  className="h-11 flex-1 rounded-xl bg-linear-to-r from-indigo-500 to-violet-500 text-sm font-semibold text-white shadow-lg shadow-indigo-500/30 transition-all hover:from-indigo-500 hover:to-violet-600 hover:shadow-indigo-500/40 disabled:from-indigo-500/60 disabled:to-violet-500/60"
-                  onClick={handleAiDownload}
-                  disabled={downloadingAi}
-                >
-                  {downloadingAi ? <Loader2 className="animate-spin" /> : <Download />}
-                  {downloadingAi ? "Downloading…" : "Download image"}
-                </Button>
-                <Button
-                  className="h-11 flex-1 rounded-xl bg-linear-to-r from-indigo-500 to-violet-500 text-sm font-semibold text-white shadow-lg shadow-indigo-500/30 transition-all hover:from-indigo-500 hover:to-violet-600 hover:shadow-indigo-500/40 disabled:from-indigo-500/60 disabled:to-violet-500/60"
-                  onClick={handleTilesview}
-                  disabled={sendingToTilesview}
-                >
-                  {sendingToTilesview ? <Loader2 className="animate-spin" /> : <MonitorSmartphone />}
-                  {sendingToTilesview ? "Sending to TilesView…" : "Send to Visualizer"}
-                </Button>
+          ) : (
+            <>
+              <div className="rounded-xl border border-border/70 bg-card/60 p-3">
+                <p className="mb-1 flex items-center gap-1.5 text-[13px] font-medium text-foreground">
+                  <Sparkles className="size-3.5 text-amber-500" />
+                  “{selected.sheetName ?? selected.fileName}”
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  AI visualization is generated with the standard room styling prompt.
+                </p>
               </div>
-            </div>
+
+              {generating ? (
+                <div className="flex h-20 items-center justify-center gap-2 rounded-xl border border-border/70 bg-card/60 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  Generating AI image…
+                </div>
+              ) : (
+                <Button
+                  className="h-10 w-full rounded-xl bg-linear-to-r from-amber-500 to-orange-500 text-sm font-semibold text-white shadow-md shadow-amber-500/25 transition-all hover:from-amber-500 hover:to-orange-600 hover:shadow-amber-500/35 disabled:from-amber-500/60 disabled:to-orange-500/60"
+                  onClick={handleGenerate}
+                >
+                  <Sparkles />
+                  {selectedAiDone ? "Regenerate AI image" : "Generate AI image"}
+                  {selectedAiUsage ? ` (${selectedAiUsage.used}/${selectedAiUsage.limit})` : ""}
+                </Button>
+              )}
+
+              {selectedAiUsage && selectedAiUsage.used >= selectedAiUsage.limit && (
+                <p className="px-1 text-center text-xs text-muted-foreground">
+                  Generation limit reached ({selectedAiUsage.limit}/{selectedAiUsage.limit}) for this sheet.
+                  Convert the DWG again to generate more.
+                </p>
+              )}
+
+              {selectedAiDone && !generating && (
+                <div className="animate-slide-up">
+                  <ImagePreviewCard
+                    src={aiDownloadUrl(selected.conversionId)}
+                    alt={`AI visualization: ${selected.fileName}`}
+                    imageClassName="h-64"
+                    onToggleBig={() => setLightbox({ kind: "ai", id: selected.conversionId })}
+                    onDownload={handleAiDownload}
+                  />
+                  <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                    <Button
+                      className="h-11 flex-1 rounded-xl bg-linear-to-r from-indigo-500 to-violet-500 text-sm font-semibold text-white shadow-lg shadow-indigo-500/30 transition-all hover:from-indigo-500 hover:to-violet-600 hover:shadow-indigo-500/40 disabled:from-indigo-500/60 disabled:to-violet-500/60"
+                      onClick={handleTilesview}
+                      disabled={sendingToTilesview}
+                    >
+                      {sendingToTilesview ? <Loader2 className="animate-spin" /> : <MonitorSmartphone />}
+                      {sendingToTilesview ? "Sending to TilesView…" : "Send to Visualizer"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
+      </div>
+
+      {selectedWarnings.length > 0 && (
+        <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.07] px-3.5 py-2.5 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">{warningsHeadline}</p>
+          <details className="mt-1.5">
+            <summary className="cursor-pointer list-none font-medium underline decoration-dotted underline-offset-4">
+              Details ({selectedWarnings.length})
+            </summary>
+            <ul className="mt-1.5 list-inside list-disc space-y-0.5">
+              {selectedWarnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          </details>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        <Button
+          variant="outline"
+          className="w-full h-11 rounded-xl text-sm flex-1"
+          onClick={onReset}
+        >
+          <LayoutGrid />
+          Convert another DWG
+        </Button>
       </div>
 
       <ImageLightbox
         open={lightbox !== null}
         onOpenChange={(open) => !open && setLightbox(null)}
         src={lightboxSrc}
-        alt={lightbox === "ai" ? "AI visualization preview" : "Converted PNG preview"}
-        title={lightbox === "ai" ? "AI Image" : "Converted PNG"}
-        subtitle={lightbox === "ai" ? `${result.fileName.replace(/\.png$/i, "")}-ai.png` : result.fileName}
-        onDownload={lightbox === "ai" ? handleAiDownload : handleDownload}
-        downloadLabel={lightbox === "ai" ? "Download AI image" : "Download PNG"}
+        alt={lightbox?.kind === "ai" ? "AI visualization preview" : "Converted PNG preview"}
+        title={lightboxTitle}
+        subtitle={lightboxSubtitle}
       />
     </div>
   );

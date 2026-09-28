@@ -96,6 +96,19 @@ export function entityBounds(entity: Entity): Bounds {
       }
       return rect(minX, minY, maxX, maxY);
     }
+    case "IMAGE": {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const vertex of entity.vertices) {
+        minX = Math.min(minX, vertex.x);
+        minY = Math.min(minY, vertex.y);
+        maxX = Math.max(maxX, vertex.x);
+        maxY = Math.max(maxY, vertex.y);
+      }
+      return rect(minX, minY, maxX, maxY);
+    }
     default:
       return rect(0, 0, 0, 0);
   }

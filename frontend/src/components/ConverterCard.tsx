@@ -12,8 +12,10 @@ interface ConverterCardProps {
   file: File | null;
   converting: boolean;
   step: ProgressStep;
+  uploadProgress?: number | null;
   error: string | null;
-  result: ConversionResultData | null;
+  results: ConversionResultData[] | null;
+  skippedBlankSheets?: string[];
   maxMb: number;
   onFile: (file: File) => void;
   onClear: () => void;
@@ -26,8 +28,10 @@ export default function ConverterCard({
   file,
   converting,
   step,
+  uploadProgress,
   error,
-  result,
+  results,
+  skippedBlankSheets,
   maxMb,
   onFile,
   onClear,
@@ -57,10 +61,10 @@ export default function ConverterCard({
           maxMb={maxMb}
         />
 
-        {converting && <ConversionProgress step={step} />}
+        {converting && <ConversionProgress step={step} uploadProgress={uploadProgress} />}
         {error && !converting && <ErrorMessage message={error} />}
 
-        {!result && !converting && (
+        {!results && !converting && (
           <div className="mt-5 flex items-center gap-3">
             <Button
               size="lg"
@@ -95,7 +99,13 @@ export default function ConverterCard({
           </div>
         )}
 
-        {result && <ConversionResult result={result} onReset={onReset} />}
+        {results && results.length > 0 && (
+          <ConversionResult
+            results={results}
+            skippedBlankSheets={skippedBlankSheets}
+            onReset={onReset}
+          />
+        )}
       </div>
     </div>
   );

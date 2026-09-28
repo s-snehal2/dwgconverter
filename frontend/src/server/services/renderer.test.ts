@@ -20,6 +20,8 @@ function drawing(entities: Entity[]): Drawing {
         return e.vertices.map((v) => v.x);
       case "SOLID":
         return e.vertices.map((v) => v.x);
+      case "IMAGE":
+        return e.vertices.map((v) => v.x);
       case "TEXT":
       case "MTEXT":
         return [e.position.x];
@@ -39,6 +41,8 @@ function drawing(entities: Entity[]): Drawing {
       case "POLYLINE":
         return e.vertices.map((v) => v.y);
       case "SOLID":
+        return e.vertices.map((v) => v.y);
+      case "IMAGE":
         return e.vertices.map((v) => v.y);
       case "TEXT":
       case "MTEXT":
@@ -185,6 +189,23 @@ describe("renderToSvg", () => {
     expect(svg).toContain('fill="none"');
   });
 
+  it("renders a raster image as a light placeholder frame", () => {
+    const imageEntities: Entity[] = [
+      {
+        type: "IMAGE",
+        vertices: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 50 }, { x: 0, y: 50 }],
+        color: "#000000",
+        layer: "0",
+        lineWeight: 25,
+        sourceType: "IMAGE",
+      },
+    ];
+    const svg = renderToSvg(drawing(imageEntities), { colorMode: "monochrome", maxWidth: 800, maxHeight: 800, margin: 50 });
+    expect(svg).toContain("<polygon");
+    expect(svg).toContain('fill="#e5e7eb"');
+    expect(svg).toContain('stroke="#000000"');
+  });
+
   it("wraps content in a scaled group when supersampling", () => {
     const svg = renderToSvg(drawing(entities), {
       colorMode: "monochrome",
@@ -319,8 +340,9 @@ describe("lite rendering for picker thumbnails", () => {
   it("decimates model content inside viewports", () => {
     const full = renderToSvg(heavyPageDrawing(), PAGE_OPTIONS);
     const lite = renderToSvg(heavyPageDrawing(), { ...PAGE_OPTIONS, lite: true });
-    // Full: sheet border + all 4000 model lines projected.
-    expect(countLines(full)).toBe(4001);
+    // Full: sheet border + the model lines whose boxes overlap the viewport
+    // window (viewCenter 50,50 width 150 => x -25..125, covering i=0..125).
+    expect(countLines(full)).toBe(127);
     // Lite: the border stays, but the model is sampled down to a fixed cap.
     expect(countLines(lite)).toBeGreaterThan(0);
     expect(countLines(lite)).toBeLessThanOrEqual(2001);

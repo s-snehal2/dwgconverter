@@ -99,6 +99,17 @@ export interface SolidEntity extends EntityBase {
   filled: boolean;
 }
 
+/**
+ * A raster IMAGE entity. The DWG only stores a reference to an external image
+ * file (no pixel data is available to the parser), so the image is normalized
+ * to its placement quadrilateral and rendered as a placeholder frame.
+ */
+export interface ImageEntity extends EntityBase {
+  type: "IMAGE";
+  /** The image quadrilateral corners (insert, insert+u, insert+u+v, insert+v). */
+  vertices: CadPoint[];
+}
+
 export type Entity =
   | LineEntity
   | CircleEntity
@@ -108,7 +119,8 @@ export type Entity =
   | PolylineEntity
   | TextEntity
   | MTextEntity
-  | SolidEntity;
+  | SolidEntity
+  | ImageEntity;
 
 export const SUPPORTED_ENTITY_TYPES: ReadonlySet<Entity["type"]> = new Set([
   "LINE",
@@ -120,6 +132,7 @@ export const SUPPORTED_ENTITY_TYPES: ReadonlySet<Entity["type"]> = new Set([
   "SOLID",
   "TEXT",
   "MTEXT",
+  "IMAGE",
 ]);
 
 export function isSupportedEntity(entity: Entity): boolean {

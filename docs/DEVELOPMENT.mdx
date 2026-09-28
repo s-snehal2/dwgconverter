@@ -34,20 +34,29 @@ focuses on how the pieces fit together so you can extend or debug the app.
 
 ## Overview
 
-A self-hosted web app that converts a single DWG drawing into a PNG image:
+A self-hosted web app that converts a DWG drawing into PNG images:
 
 1. The user uploads a `.dwg` file.
-2. The server reads and normalizes the drawing, renders it into an SVG, and
-   rasterizes that SVG into a white-background PNG.
-3. The user can preview and download the PNG.
-4. Optionally, the server sends the PNG to Google Gemini to produce a
-   photorealistic architectural visualization of the same drawing.
+2. The server reads and normalizes the drawing, renders the model space and/or
+   every paper-space layout into an SVG, and rasterizes each into a
+   white-background PNG — **one PNG per sheet**.
+3. The user previews the sheets, selects one, and can download it.
+4. Optionally, the server sends the **selected** sheet's PNG to Google Gemini to
+   produce a photorealistic architectural visualization. The user can describe
+   the image they want and it is appended to the built-in prompt.
 
 Design principles:
 
-- **Single-page export.** The app exports exactly **one** sheet per conversion.
-  A DWG with more paper-space layouts than `MAX_LAYOUTS` (default `1`) is
-  rejected early with `MULTIPLE_LAYOUTS` instead of spending minutes rendering.
+- **Multi-sheet export.** The app exports every paper-space layout as its own
+  sheet (PNG + conversion id), followed by the model-space crops. A DWG with
+  more layouts than `MAX_LAYOUTS` (default `100`) is rejected early with
+  `MULTIPLE_LAYOUTS` instead of spending minutes rendering. Model crops share
+  that budget and are merged down to whatever the layouts leave over.
+- **Model space split by drawing.** Model space in a multi-layout DWG holds
+  every drawing parked side by side, so it is cut at the widest whitespace gaps
+  into separate, tightly-cropped sheets (`Model`, `Model 2`, ...). A gap worth
+  less than `MODEL_CLUSTER_GAP_FRACTION` of the overall model size is internal
+  detail, so a dense drawing is never shredded.
 - **Own renderer.** The SVG is produced by our own renderer from a normalized
   internal model, not by the DWG parser's SVG writer. This decouples
   rasterization from parsing and keeps control of line weights, colors, and
@@ -83,27 +92,30 @@ Browser ─► POST /api/convert ─► validate (extension, size, signature, ra
         ▼                        ▼
                              convertDwg (orchestrator)
                                     │
-        ┌───────────────────────────┼───────────────────────────┐
-        ▼                           ▼                           ▼
-   dwgReader                countPaperLayouts               dwgParser
-   (acad-ts port)           (reject > MAX_LAYOUTS)          (normalize model)
-        │                           │                           │
-        └───────────────────────────┼───────────────────────────┘
                                     ▼
-                        selectViewForConversion (one sheet)
+                              dwgReader (acad-ts port)
                                     │
                                     ▼
-                           renderer → renderToSvg
+                             parseViews → every renderable view
                                     │
                                     ▼
-                     pngGenerator → sharp (SVG → PNG)
+                     selectViewsForConversion (all layout sheets, then
+                                                model clusters; total capped
+                                                by MAX_LAYOUTS)
                                     │
-                                    ▼
-                 write {id}.png + {id}.png.name sidecar
+                       ┌────────────┴────────────┐
+                       ▼ every sheet, in order    │
+                 renderer → renderToSvg           │
+                       │                          │
+                       ▼                          │
+                pngGenerator → sharp ─────────────┘
                                     │
-                                    ▼
-            client preview: GET /api/download/[id]
-            optional AI:     POST /api/generate/[id] → GET /api/download-ai/[id]
+                        ┌───────────┴────────────────────┐
+                        ▼                                ▼
+              write {id}.png per sheet        client preview:
+              + {id}.png.name sidecar         GET /api/download/[id]
+                                                optional AI:     POST /api/generate/[id] { prompt }
+                                                                  → GET /api/download-ai/[id]
 ```
 
 ### Directory layout
@@ -124,7 +136,7 @@ dwg2png/
 │   │   ├── components/
 │   │   │   ├── ConverterCard.tsx               # upload / convert / cancel / reset UI
 │   │   │   ├── ConversionProgress.tsx          # step indicator (upload→parse→render)
-│   │   │   ├── ConversionResult.tsx            # preview, warnings, downloads
+│   │   │   ├── ConversionResult.tsx            # sheet gallery: select + download + AI
 │   │   │   ├── ErrorMessage.tsx
 │   │   │   ├── ImageLightbox.tsx
 │   │   │   └── ImagePreviewCard.tsx
@@ -193,28 +205,63 @@ On every `POST /api/convert`:
 `convertDwg` runs three phases and reports timings for each:
 
 ```ts
-const inspected = await inspectDwg(arrayBuffer, logger, overrides, { maxLayouts });
-const view = selectViewForConversion(inspected.views, config.maxLayouts);
-const output = await renderViewPng(view, config, logger);
+const inspected = await inspectDwg(arrayBuffer, logger, overrides);
+const views = selectViewsForConversion(inspected.views, config.maxLayouts);
+const sheets = [];
+const skippedBlankSheets = [];           // blank sheets are dropped, not emitted
+for (const view of views) {
+  const output = await renderViewPng(view, config, logger);
+  if ((await rasterInkFraction(output.png)) < config.blankSheetInkFraction) {
+    skippedBlankSheets.push(view.name);
+    continue;                           // never reaches saveOutput()
+  }
+  sheets.push(output);
+}
+if (sheets.length === 0) throw new AppError("NO_DRAWABLE_CONTENT", "…");
 ```
 
 - **Signature check** — `validateDwgSignature` verifies the `AC10` magic bytes
-  and the version (`AC1014`…`AC1032` = R14…2018). Passwords/corruption or an
-  unknown version are rejected before any heavy parsing.
-- **Early layout count** — `countPaperLayouts` walks the ACAD_LAYOUT table (not
-  entity data) and rejects the file with `MULTIPLE_LAYOUTS` if there are more
-  paper-space layouts than `maxLayouts`. This is the cheap fail-fast path: big
-  multi-sheet files are refused in seconds instead of after minutes of block
-  explosion.
+  and the version (`AC1012`…`AC1032` = R13…2018+). Passwords/corruption or an
+  unknown version are rejected before any heavy parsing. Note the format has
+  not changed since 2018: `AC1032` also covers AutoCAD 2019 through 2027.
 - **Parse** — `dwgParser.parseViews` normalizes the model space and every
-  paper-space layout into `ParsedView`s.
-- **Selection** — `selectViewForConversion` picks the single sheet to render:
-  the paper-space layout if present, else the raw model space. With no content
-  at all it throws `NO_DRAWABLE_CONTENT`.
-- **Render** — `renderViewPng` renders and rasterizes at up to
-  `MAX_PNG_DIMENSION`. For very large drawings (≥ 15,000 normalized entities)
-  the supersample is disabled (`supersampleForEntities`) — a 6000px canvas with
-  tens of thousands of entities would otherwise be disproportionately slow.
+  paper-space layout into `ParsedView`s. Views are the renderable units; each
+  carries its own bounds, page (viewport windows), and statistics.
+- **Selection** — `selectViewsForConversion` returns **every** paper-space
+  layout view in draw order, followed by the model-space crops. If the renderable
+  layout count exceeds `maxLayouts` it throws `MULTIPLE_LAYOUTS`; with no content
+  at all it throws `NO_DRAWABLE_CONTENT`. `selectViewForConversion` remains as
+  the single-sheet helper (`selectViewsForConversion(...)[0]`).
+- **Model clustering** — `expandModelView` turns the single model view into one
+  view per drawing cluster via `modelClusterer.clusterModelEntities`, named
+  `Model`, `Model 2`, ... The cluster's own bounds flow into `computeViewport`,
+  which already fits any bounds to the full canvas, so tight bounds are all the
+  zoom that is needed. Clusters beyond the remaining budget are merged into
+  their nearest neighbour by `limitClusters` rather than dropped, so capping
+  output can only coarsen crops — never lose entities.
+- **Render** — each selected view is rendered and rasterized at up to
+  `MAX_PNG_DIMENSION` via `renderViewPng`. For very large drawings
+  (≥ 15,000 normalized entities) the supersample is disabled
+  (`supersampleForEntities`) — a 6000px canvas with tens of thousands of
+  entities would otherwise be disproportionately slow.
+- **Blank sheets are dropped** — `rasterInkFraction` measures ink coverage on
+  the rendered PNG. A sheet under `blankSheetInkFraction`
+  (`BLANK_SHEET_INK_FRACTION`, default 0.005 = half a percent of the page) is
+  recorded in `skippedBlankSheets` and **not** returned in `sheets`, so it is
+  never rasterized to storage, never downloaded, and never offered to the AI
+  step. The UI shows a "N blank sheets were omitted" note listing the names.
+  The threshold is deliberately low so a real but sparse plan is kept; the
+  trade-off is that it is fixed at request time, so a drawing lost in production
+  is corrected by setting the env var rather than a redeploy. This applies to
+  model crops as well as layouts — a whitespace-only cluster is exactly the
+  case worth dropping. If *every* sheet is blank, the conversion is rejected
+  with `NO_DRAWABLE_CONTENT` (422) rather than returning an empty result the UI
+  cannot render.
+- **Two other ways a sheet never becomes a view** — a layout with zero
+  entities *and* zero viewports never becomes a view at all:
+  `pageFromBlockRecord` (`dwgParser.ts`) returns `null` because there are no
+  bounds to compute a viewport from. And a DWG with more layouts than
+  `MAX_LAYOUTS` is rejected with `MULTIPLE_LAYOUTS` before any rendering.
 
 ### 3. Reading — `dwgReader.ts`
 
@@ -372,9 +419,12 @@ interface ConversionStatistics {
 
 ### Client types (`types/conversion.ts`)
 
-Server responses are typed by `ConversionResult` (id, `fileName`, `size`,
-`version`, `statistics`, `warnings`, `durationMs`) and `AiImageResult`
-(`conversionId`, `fileName`, `size`, `durationMs`).
+Server responses are typed by `MultiSheetResult` (`originalFileName`,
+`sheets: ConversionResult[]`, `sheetCount`, `version`, `durationMs`) and
+`AiImageResult` (`conversionId`, `fileName`, `size`, `durationMs`). Each
+`ConversionResult` carries its own `conversionId`, `fileName`, `sheetName`
+(e.g. "FLOORING LAYOUT"), `statistics`, and `warnings`, so every sheet is a
+self-contained download/AI target.
 
 ---
 
@@ -383,15 +433,22 @@ Server responses are typed by `ConversionResult` (id, `fileName`, `size`,
 Optional, gated on `GEMINI_API_KEY` being set. Flow:
 
 1. `POST /api/generate/[id]` — validates the id, the key, the rate limit, and
-   that `outputs/{id}.png` exists.
+   that `outputs/{id}.png` exists. An optional `{ prompt }` JSON body carries
+   the user's description of the image they want (length-capped at
+   `MAX_AI_PROMPT_CHARS`, default 1000).
 2. Reads the converted PNG and calls `generateDrawingImage` in
    `server/services/geminiImage.ts`:
 
    - `generateContent` to Gemini 3.1 Flash (`gemini-3.1-flash-image`,
      overridable via `GEMINI_MODEL`), payload is `{ parts: [{ inlineData:
      { mimeType: "image/png", data: <base64> } }, { text: prompt }] }`.
+   - `composeAiPrompt` merges the built-in base prompt with the user prompt:
+     the base prompt always runs (it enforces "preserve the drawing, no text,
+     single unified scene"), then the user's request is appended so they can
+     steer style, lighting, materials, etc. Empty/blank prompts fall back to
+     the base prompt alone.
    - The response is parsed leniently for inline or generated-byte data.
-   - A **90-second `AbortSignal.timeout`** abort maps to a friendly
+   - A **timeout** (`GEMINI_TIMEOUT_MS`, default 240s) abort maps to a friendly
      `AI_GENERATION_ERROR` ("timed out") instead of a dangling request.
 
 3. Stores `outputs/{id}.ai.png` (+ `.name` sidecar `{base}-ai.png`) and
@@ -399,7 +456,7 @@ Optional, gated on `GEMINI_API_KEY` being set. Flow:
 4. `GET /api/download-ai/[id]` serves the generated PNG (same conventions as
    the regular download, including content-type validation client-side).
 
-The default static prompt (`DEFAULT_GEMINI_PROMPT` in `config.ts`) asks Gemini
+The default base prompt (`DEFAULT_GEMINI_PROMPT` in `config.ts`) asks Gemini
 to identify the space from the drawing itself and produce a photorealistic,
 **text-free** visualization that preserves the original geometry exactly. It is
 overridable with `GEMINI_PROMPT`.
@@ -417,7 +474,10 @@ values without import-order tricks) and returns an `AppConfig`. Paths
 | Env var | Default | Description |
 | --- | --- | --- |
 | `MAX_FILE_SIZE_MB` | `50` | Upload size limit in MB |
-| `MAX_LAYOUTS` | `1` | Max paper-space layouts; more → `MULTIPLE_LAYOUTS` rejection |
+| `MAX_LAYOUTS` | `100` | Max sheets converted per DWG; more layouts → `MULTIPLE_LAYOUTS` rejection. Model crops are merged into the remaining budget |
+| `MODEL_CLUSTER_GAP_FRACTION` | `0.03` | Whitespace, as a fraction of the whole model's size, that counts as a gap *between* drawings |
+| `MODEL_CLUSTER_MAX_DEPTH` | `12` | Recursion ceiling for model clustering; caps worst-case crop count |
+| `MAX_AI_PROMPT_CHARS` | `1000` | Max length of the user-supplied AI image prompt |
 | `MAX_PNG_DIMENSION` | `3000` | Max output width/height in px (fitted inside, no upscaling) |
 | `PNG_SUPERSAMPLE` | `2` | Supersample factor for anti-aliasing (rendered large, downscaled) |
 | `MIN_STROKE_PX` | `1` | Minimum stroke thickness in px so hairlines stay visible |
@@ -450,20 +510,29 @@ an internal stack trace (see [Errors](#errors--rate-limiting)).
 Multipart form-data, field `file` (`*.dwg`).
 
 - Runtime: `nodejs`, `maxDuration: 300`.
-- Validates: extension, size, DWG signature/version, layout count, rate limit.
+- Validates: extension, size, DWG signature/version, sheet count, rate limit.
 - **200**
 
 ```json
 {
   "success": true,
-  "conversionId": "uuid",
   "originalFileName": "floor.dwg",
-  "fileName": "floor.png",
-  "size": 284123,
+  "sheetCount": 2,
   "version": "AC1032",
-  "statistics": { "totalEntities": 1024, "renderedEntities": 980, "skippedEntities": 44, "warnings": [] },
-  "warnings": [],
-  "durationMs": 5231
+  "durationMs": 7231,
+  "sheets": [
+    {
+      "conversionId": "uuid-1",
+      "originalFileName": "floor.dwg",
+      "fileName": "floor-CIVIL LAYOUT.png",
+      "sheetName": "CIVIL LAYOUT",
+      "viewId": "layout",
+      "size": 284123,
+      "version": "AC1032",
+      "statistics": { "totalEntities": 1024, "renderedEntities": 980, "skippedEntities": 44, "warnings": [] },
+      "warnings": []
+    }
+  ]
 }
 ```
 
@@ -473,8 +542,13 @@ Multipart form-data, field `file` (`*.dwg`).
 
 ### `POST /api/generate/[id]`
 
-Generates the AI image for an existing conversion. Requires `GEMINI_API_KEY`.
+Generates the AI image for an existing sheet conversion. Requires
+`GEMINI_API_KEY`.
 
+- Body: optional JSON `{ "prompt": "..." }` — the user's description of the
+  image they want. It is appended to the built-in base prompt. Prompts longer
+  than `MAX_AI_PROMPT_CHARS` are rejected with 400. Blank/missing prompts fall
+  back to the base prompt alone.
 - Validates: id format, key present, rate limit, output file exists.
 - **200** → `{ success, conversionId, fileName, size, durationMs }`.
 - **503** `AI_NOT_CONFIGURED` when the key is missing; **404** `FILE_NOT_FOUND`
@@ -506,7 +580,7 @@ produces the user message and HTTP status so UI and API never drift.
 | `FILE_TOO_LARGE` | 400 | File size exceeds the allowed limit. |
 | `RATE_LIMITED` | 400 | Too many requests. Please try again shortly. |
 | `CORRUPTED_DWG` | 422 | Unable to read DWG file. It may be corrupted or password-protected. |
-| `UNSUPPORTED_DWG_VERSION` | 422 | Unsupported DWG version. R14 (AC1014) and newer are supported. |
+| `UNSUPPORTED_DWG_VERSION` | 422 | Unsupported DWG version. R13 (AC1012) and newer are supported. |
 | `MULTIPLE_LAYOUTS` | 422 | This DWG contains more than one drawing… |
 | `PARSER_ERROR` | 422 | The DWG file could not be parsed. |
 | `NO_DRAWABLE_CONTENT` | 422 | No drawable content was found in this DWG file. |
@@ -582,8 +656,12 @@ Copy `frontend/.env.example` → `frontend/.env` (Next.js auto-loads it from the
 
 Vitest covers:
 
-- `convertDwg` orchestration decisions: layout counting, single-sheet selection,
-  `MULTIPLE_LAYOUTS` rejection.
+- `convertDwg` orchestration decisions: sheet selection (all layouts, then the
+  model crops, Model fallback, `MAX_LAYOUTS` cap → `MULTIPLE_LAYOUTS`
+  rejection).
+- `modelClusterer` gap splitting: wide gaps separate drawings, sub-threshold
+  gaps do not, both axes are handled, recursion is depth-bounded, straddling
+  entities are never duplicated, and the budget merge never loses entities.
 - API routes (`convert`, `generate`, `download`, `download-ai`) with fake
   reader ports, throwaway `TEMP_DIR`s, and in-memory FormData.
 - Pure functions: geometry, line weights, coordinate mapping, bounds,
@@ -598,14 +676,23 @@ integration tests.
 
 ## Known limitations
 
-- **One sheet per file** — multi-layout DWGs are rejected by design
-  (`MAX_LAYOUTS`, default 1). Raise it, but note the renderer still exports
-  only the first paper-space sheet chosen by `selectViewForConversion`.
+- **Model crops share the layout budget** — layouts are emitted first, and the
+  model crops get whatever slots remain under `MAX_LAYOUTS` (default 100). A DWG
+  whose layouts alone fill the budget therefore exports no model crop; DWGs with
+  more layouts than `MAX_LAYOUTS` are rejected instead of rendering unbounded
+  sheets. Rendering runs sequentially inside the route's 300s budget.
+- **Clustering is scale-relative** — gaps are measured against the whole model
+  size, which keeps a dense drawing intact but means an extreme outlier
+  (a stray note orders of magnitude away) can inflate the reference size and
+  mask the real gaps between drawings.
 - **Text alignment** — `textAlignment` in `entityExtractor.ts` currently
   returns a constant left/baseline alignment; CAD horizontal/vertical alignment
   flags are parsed but not applied yet.
-- **DWG versions** — R14 (`AC1014`) through 2018 (`AC1032`) are accepted;
-  anything newer fails signature/version validation.
+- **DWG versions** — R13 (`AC1012`) through 2018+ (`AC1032`) are accepted.
+  `AC1032` also covers AutoCAD 2019–2027, since the format has not changed
+  since 2018. Pre-R13 files fail signature/version validation, and would fail
+  in the parser anyway: `acad-ts` throws `CadNotSupportedException` for
+  `AC1002`–`AC1009`.
 - **Unsupported entity types** are counted and reported as warnings rather than
   rendered (see `SUPPORTED_ENTITY_TYPES`). Notable: splines are tessellated to
   polylines (faithful, but heavy).

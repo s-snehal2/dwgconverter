@@ -15,13 +15,37 @@ interface GeminiResponse {
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /**
+ * Compose the prompt sent to Gemini: the configured/base prompt always runs
+ * (it enforces the "preserve the drawing, no text" rules), and an optional
+ * user-supplied prompt is appended so the image comes out the way the user
+ * wants (style, lighting, materials, …). The user prompt is truncated to
+ * `config.maxAiPromptChars`.
+ */
+export function composeAiPrompt(userPrompt: string | undefined, config: { geminiPrompt: string; maxAiPromptChars: number }): string {
+  const base = config.geminiPrompt || "Generate a realistic visualization of this architectural drawing.";
+  if (!userPrompt) {
+    return base;
+  }
+  const trimmed = userPrompt.trim();
+  if (!trimmed) {
+    return base;
+  }
+  const user = trimmed.length > config.maxAiPromptChars
+    ? trimmed.slice(0, config.maxAiPromptChars)
+    : trimmed;
+  return `${base}\n\nThe user wants this specific visualization:\n${user}`;
+}
+
+/**
  * Call the Gemini Nano Banana 2 REST API to generate a photorealistic
- * visualization of the supplied architectural drawing PNG using a
- * static prompt. Returns the generated image as a PNG Buffer.
+ * visualization of the supplied architectural drawing PNG. The base prompt is
+ * always sent; an optional user prompt is appended to steer the output.
+ * Returns the generated image as a PNG Buffer.
  */
 export async function generateDrawingImage(
   png: Buffer,
   config: AppConfig,
+  userPrompt?: string,
 ): Promise<{ image: Buffer; durationMs: number }> {
   const started = Date.now();
 
@@ -30,7 +54,7 @@ export async function generateDrawingImage(
   }
 
   const model = config.geminiModel || "gemini-3.1-flash-image";
-  const prompt = config.geminiPrompt || "Generate a realistic visualization of this architectural drawing.";
+  const prompt = composeAiPrompt(userPrompt, config);
 
   const body = {
     contents: [

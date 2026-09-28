@@ -27,10 +27,20 @@ function makeSandbox(): string {
   delete process.env.CLEANUP_AGE_MINUTES;
   delete process.env.RATE_LIMIT_PER_MINUTE;
   delete process.env.AI_GENERATION_LIMIT;
+  delete process.env.MAX_AI_PROMPT_CHARS;
   return dir;
 }
 
-const request = () => new Request("http://localhost/api/generate/x", { method: "POST" }) as never;
+const request = (body?: unknown) =>
+  new Request("http://localhost/api/generate/x", {
+    method: "POST",
+    ...(body === undefined
+      ? {}
+      : {
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+  }) as never;
 const params = (id: string) => ({ params: Promise.resolve({ id }) });
 
 describe("POST /api/generate/[id]", () => {
@@ -80,5 +90,32 @@ describe("POST /api/generate/[id]", () => {
     const ok = await POST(request(), params(ID));
     expect(ok.status).toBe(200);
     expect(((await ok.json()) as { generationsUsed: number }).generationsUsed).toBe(1);
+  });
+
+  it("forwards a user prompt to the Gemini service", async () => {
+    const res = await POST(request({ prompt: "make it a luxury bathroom" }), params(ID));
+    expect(res.status).toBe(200);
+    expect(mockedGenerate).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      expect.objectContaining({ geminiApiKey: "test-key" }),
+      "make it a luxury bathroom",
+    );
+  });
+
+  it("treats a missing or blank prompt as undefined", async () => {
+    await POST(request({ prompt: "" }), params(ID));
+    await POST(request({ prompt: "   " }), params(ID));
+    const calls = mockedGenerate.mock.calls;
+    expect(calls[0]![2]).toBeUndefined();
+    expect(calls[1]![2]).toBeUndefined();
+  });
+
+  it("rejects an over-long prompt with 400", async () => {
+    const longPrompt = "x".repeat(2001);
+    const res = await POST(request({ prompt: longPrompt }), params(ID));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { success: boolean };
+    expect(body.success).toBe(false);
+    expect(mockedGenerate).not.toHaveBeenCalled();
   });
 });

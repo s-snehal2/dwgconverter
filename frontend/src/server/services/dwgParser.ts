@@ -1,4 +1,4 @@
-import { Insert, Viewport, Hatch, Dimension, Leader } from "@node-projects/acad-ts";
+import { Insert, Viewport, Hatch, Dimension, Leader, Wipeout } from "@node-projects/acad-ts";
 import type { BlockRecord, CadDocument, Layout } from "@node-projects/acad-ts";
 import type { RawDwgData } from "./dwgReader";
 import { extractEntity, extractHatch, extractLeader, entityIsVisible, normalizeLayer } from "./entityExtractor";
@@ -93,6 +93,18 @@ class WarningCollector {
  */
 const MAX_BLOCK_EXPANSION_DEPTH = 16;
 
+/**
+ * Append `items` to `target` without spreading. `Array.prototype.push(...items)`
+ * passes every element as a call argument, so a single block/hatch/dimension
+ * that expands to tens of thousands of entities blows the V8 argument limit
+ * ("Maximum call stack size exceeded" with no recursion in the stack).
+ */
+function pushAll<T>(target: T[], items: T[]): void {
+  for (let i = 0; i < items.length; i += 1) {
+    target.push(items[i]);
+  }
+}
+
 /** Normalize one acad-ts entity (including INSERT expansion) into model entities. */
 function normalizeEntity(
   entity: unknown,
@@ -119,7 +131,7 @@ function normalizeEntity(
         if (NON_RENDERABLE_NAMES.has(subName)) {
           continue;
         }
-        expanded.push(...normalizeEntity(subEntity, warnings, depth + 1));
+        pushAll(expanded, normalizeEntity(subEntity, warnings, depth + 1));
       }
     } catch {
       warnings.add("A block/insert could not be expanded and was skipped.");
@@ -165,6 +177,12 @@ function normalizeEntity(
     }
   }
 
+  if (acadEntity instanceof Wipeout) {
+    // A wipeout covers whatever is behind it with the background color. On a
+    // white sheet that is invisible, so it is dropped silently.
+    return [];
+  }
+
   try {
     if (!entityIsVisible(acadEntity)) {
       return [];
@@ -207,7 +225,7 @@ function expandDimensionBlock(dimension: Dimension, warnings: WarningCollector, 
       const part = normalizeEntity(subEntity, warnings, depth + 1);
       if (part.length > 0) {
         renderedAny = true;
-        expanded.push(...part);
+        pushAll(expanded, part);
       }
     }
   } catch {
@@ -286,7 +304,7 @@ function pageFromBlockRecord(blockRecord: BlockRecord | null, warnings: WarningC
       }
       continue;
     }
-    pageEntities.push(...normalizeEntity(entity, warnings));
+    pushAll(pageEntities, normalizeEntity(entity, warnings));
   }
 
   let bounds = drawingBounds(pageEntities);
@@ -342,7 +360,7 @@ function normalizeModelSpace(document: CadDocument, warnings: WarningCollector):
       if (normalized.length > 0) {
         rendered += 1;
       }
-      entities.push(...normalized);
+      pushAll(entities, normalized);
     }
   }
   return { entities, total, rendered };
@@ -455,7 +473,7 @@ export function parseViews(raw: RawDwgData): ViewsResult {
       statistics: viewStatistics(model.total, model.rendered, warnings),
     });
   }
-  views.push(...paperSpaceViews(document, warnings, model, layers, blocks));
+  pushAll(views, paperSpaceViews(document, warnings, model, layers, blocks));
 
   if (views.length === 0) {
     throw new Error("No drawable model space content was found in this drawing.");

@@ -2,6 +2,11 @@
 # Only .env.example templates are tracked.
 .env*
 !.env.example
+**/.env*
+!**/.env.example
+
+# Editor / agent tooling local to this machine
+.opencode/
 
 # Runtime temp files (uploaded DWGs + converted outputs)
 /temp/

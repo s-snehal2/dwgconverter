@@ -1,18 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { DxfReader, DwgWriter } from "@node-projects/acad-ts";
 import { Line, Viewport, XYZ, XY } from "@node-projects/acad-ts";
 import type { CadDocument } from "@node-projects/acad-ts";
 import { convertDwg } from "./convertDwg";
+import { minimalDwgBytes } from "./testFixture";
 import type { AppConfig } from "../config";
 import sharp from "sharp";
 
 const TEST_CONFIG: AppConfig = {
-  maxFileSizeBytes: 50 * 1024 * 1024,
+  maxFileSizeBytes: 80 * 1024 * 1024,
+  conversionBudgetMs: 260_000,
   maxPngDimension: 1000,
   marginPx: 50,
   pngSupersample: 2,
   minStrokePx: 1.2,
-  maxLayouts: 1,
+  maxLayouts: 100,
+  blankSheetInkFraction: 0.005,
+  modelClusterGapFraction: 0.03,
+  modelClusterMaxDepth: 12,
+  maxAiPromptChars: 1000,
   cleanupAgeMs: 30 * 60 * 1000,
   tempRootDir: "",
   uploadsDir: "",
@@ -28,138 +33,26 @@ const TEST_CONFIG: AppConfig = {
   tilesviewAppSecret: "",
   tilesviewAppKeyHeader: "app_key",
   tilesviewAppSecretHeader: "app_secret",
+  tilesviewVisualizerBaseUrl: "https://tilesview.ai/app/EZEnoscu4lODABbT_sHm7Q/visualizer",
 };
 
-const MINIMAL_DXF = `0
-SECTION
-2
-HEADER
-9
-$ACADVER
-1
-AC1027
-9
-$INSBASE
-10
-0.0
-20
-0.0
-30
-0.0
-0
-ENDSEC
-0
-SECTION
-2
-CLASSES
-0
-ENDSEC
-0
-SECTION
-2
-TABLES
-0
-ENDSEC
-0
-SECTION
-2
-BLOCKS
-0
-ENDSEC
-0
-SECTION
-2
-ENTITIES
-0
-LINE
-8
-0
-10
-10.0
-20
-10.0
-30
-0.0
-11
-20.0
-21
-10.0
-31
-0.0
-0
-CIRCLE
-8
-0
-10
-15.0
-20
-15.0
-30
-0.0
-40
-5.0
-0
-LWPOLYLINE
-8
-0
-90
-4
-70
-1
-10
-0.0
-20
-0.0
-10
-0.0
-20
-10.0
-10
-10.0
-20
-10.0
-10
-10.0
-20
-0.0
-0
-ENDSEC
-0
-EOF
-`.trim();
-
-/** Build a real DWG byte array from a small hand-written DXF via acad-ts. */
-function makeDwgBytes(): Uint8Array {
-  const document = DxfReader.readFromStream(new TextEncoder().encode(MINIMAL_DXF));
-  // The DxfReader returns a document with empty symbol tables; the DWG writer
-  // requires the standard entries (text style, linetypes, layers, dimstyles,
-  // model/paper space blocks), so re-create the defaults before writing.
-  for (const collection of [
-    document.lineTypes,
-    document.layers,
-    document.textStyles,
-    document.dimensionStyles,
-    document.blockRecords,
-  ]) {
-    if (collection && typeof collection.createDefaultEntries === "function") {
-      collection.createDefaultEntries();
-    }
-  }
-  return DwgWriter.writeToBuffer(document);
-}
-
+/** Build a real DWG byte array from a dense model-space grid via acad-ts. */
 describe("convertDwg integration", () => {
   it("converts a real DWG into a valid PNG with expected statistics", async () => {
-    const bytes = makeDwgBytes();
+    const bytes = minimalDwgBytes(200);
     expect(bytes.length).toBeGreaterThan(64);
     const signature = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
     expect(signature).toBe("AC10");
 
     const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    const result = await convertDwg(arrayBuffer, TEST_CONFIG);
+    const { sheets, skippedBlankSheets } = await convertDwg(arrayBuffer, TEST_CONFIG);
+    expect(sheets).toHaveLength(1);
+    expect(skippedBlankSheets).toHaveLength(0);
+    const result = sheets[0];
 
-    expect(result.statistics.totalEntities).toBeGreaterThanOrEqual(3);
-    expect(result.statistics.renderedEntities).toBe(3);
+    // The grid fixture contributes 200 horizontal + 200 vertical model lines.
+    expect(result.statistics.totalEntities).toBeGreaterThanOrEqual(400);
+    expect(result.statistics.renderedEntities).toBe(400);
     expect(result.statistics.skippedEntities).toBe(0);
 
     // Valid PNG (8-byte magic signature).
@@ -179,9 +72,22 @@ describe("convertDwg integration", () => {
   });
 
   it("renders a paper-space page with a viewport at page proportions", async () => {
-    const modelLine = new Line();
-    modelLine.startPoint = new XYZ(0, 0, 0);
-    modelLine.endPoint = new XYZ(100, 100, 0);
+    // Dense grid filling the viewport window (viewHeight 100 at the 380x280
+    // page aspect => viewWidth 135.714, so x spans 50±67.857, y spans 0..100).
+    // Dense enough that the sheet is not flagged as sparse.
+    const grid: Line[] = [];
+    for (let y = 0; y <= 100; y += 2) {
+      const line = new Line();
+      line.startPoint = new XYZ(-17.857, y, 0);
+      line.endPoint = new XYZ(117.857, y, 0);
+      grid.push(line);
+    }
+    for (let x = -17.857; x <= 117.857; x += 2) {
+      const line = new Line();
+      line.startPoint = new XYZ(x, 0, 0);
+      line.endPoint = new XYZ(x, 100, 0);
+      grid.push(line);
+    }
 
     const border = new Line();
     border.startPoint = new XYZ(10, 10, 0);
@@ -198,18 +104,24 @@ describe("convertDwg integration", () => {
     const document = {
       layers: [],
       blockRecords: [],
-      modelSpace: { entities: [modelLine] },
+      modelSpace: { entities: grid },
       paperSpace: { entities: [border, viewport] },
     } as unknown as CadDocument;
 
     const buffer = new TextEncoder().encode("AC1027 page").buffer as ArrayBuffer;
 
-    const result = await convertDwg(
+    const { sheets, skippedBlankSheets } = await convertDwg(
       buffer,
       TEST_CONFIG,
       {},
       { read: () => ({ version: "AC1027", document }) }
     );
+    // The layout sheet comes first, then the model sheet. Every assertion below
+    // targets the layout, which is what this test is about.
+    expect(sheets).toHaveLength(2);
+    expect(sheets.map((s) => s.viewName)).toEqual(["Layout 1", "Model"]);
+    expect(skippedBlankSheets).toHaveLength(0);
+    const result = sheets[0];
 
     expect(result.statistics.page).toEqual({ entityCount: 1, viewportCount: 1 });
 
@@ -220,5 +132,156 @@ describe("convertDwg integration", () => {
     expect(metadata.format).toBe("png");
     expect(metadata.width).toBe(1000);
     expect(metadata.height).toBe(764);
+  });
+
+  it("omits a paper-space sheet whose viewport window frames empty model space", async () => {
+    // Model space is drawn as a dense grid, not a single line: a lone diagonal
+    // is under the blank threshold and would itself be dropped. The 2-unit
+    // spacing is tighter than MODEL_CLUSTER_GAP_FRACTION, so the grid stays a
+    // single "Model" crop rather than being split into eight. It sits in
+    // 0..100, so the viewport below (centred on 500,500) frames empty space and
+    // the layout is the blank sheet under test.
+    const modelGrid: Line[] = [];
+    for (let i = 0; i <= 100; i += 2) {
+      for (const [x1, y1, x2, y2] of [
+        [0, i, 100, i],
+        [i, 0, i, 100],
+      ] as [number, number, number, number][]) {
+        const line = new Line();
+        line.startPoint = new XYZ(x1, y1, 0);
+        line.endPoint = new XYZ(x2, y2, 0);
+        modelGrid.push(line);
+      }
+    }
+
+    const border = new Line();
+    border.startPoint = new XYZ(10, 10, 0);
+    border.endPoint = new XYZ(390, 290, 0);
+
+    const viewport = new Viewport();
+    viewport.id = 2;
+    viewport.center = new XYZ(200, 150, 0);
+    viewport.width = 380;
+    viewport.height = 280;
+    viewport.viewCenter = new XY(500, 500);
+    viewport.viewHeight = 100;
+
+    const document = {
+      layers: [],
+      blockRecords: [],
+      modelSpace: { entities: modelGrid },
+      paperSpace: { entities: [border, viewport] },
+    } as unknown as CadDocument;
+
+    const buffer = new TextEncoder().encode("AC1027 blank page").buffer as ArrayBuffer;
+
+    const { sheets, skippedBlankSheets } = await convertDwg(
+      buffer,
+      TEST_CONFIG,
+      {},
+      { read: () => ({ version: "AC1027", document }) }
+    );
+    // The layout frames empty model space, so the page is blank. It is dropped
+    // entirely: no PNG, no persisted output. The model sheet survives because
+    // model space has its own content.
+    expect(sheets).toHaveLength(1);
+    expect(sheets[0].viewName).toBe("Model");
+    expect(skippedBlankSheets).toContain("Layout 1");
+    expect(sheets[0].png.byteLength).toBeGreaterThan(0);
+  });
+
+  it("omits blank layouts and keeps the drawn ones", async () => {
+    // Two paper-space layouts: one frames a populated region of model space,
+    // the other frames empty space and is therefore blank. The blank one yields
+    // no PNG at all.
+    const grid: Line[] = [];
+    for (let y = 0; y <= 100; y += 2) {
+      const line = new Line();
+      line.startPoint = new XYZ(-17.857, y, 0);
+      line.endPoint = new XYZ(117.857, y, 0);
+      grid.push(line);
+    }
+    for (let x = -17.857; x <= 117.857; x += 2) {
+      const line = new Line();
+      line.startPoint = new XYZ(x, 0, 0);
+      line.endPoint = new XYZ(x, 100, 0);
+      grid.push(line);
+    }
+
+    const makeLayout = (name: string, viewCenter: number) => {
+      const border = new Line();
+      border.startPoint = new XYZ(10, 10, 0);
+      border.endPoint = new XYZ(390, 290, 0);
+
+      const viewport = new Viewport();
+      viewport.id = 2;
+      viewport.center = new XYZ(200, 150, 0);
+      viewport.width = 380;
+      viewport.height = 280;
+      viewport.viewCenter = new XY(viewCenter, viewCenter);
+      viewport.viewHeight = 100;
+
+      return {
+        isPaperSpace: true,
+        tabOrder: name === "Dense" ? 0 : 1,
+        name,
+        associatedBlock: { entities: [border, viewport] },
+      };
+    };
+
+    const document = {
+      layers: [],
+      blockRecords: [],
+      modelSpace: { entities: grid },
+      layouts: [makeLayout("Dense", 50), makeLayout("Sparse", 500)],
+    } as unknown as CadDocument;
+
+    const buffer = new TextEncoder().encode("AC1027 two layouts").buffer as ArrayBuffer;
+
+    const { sheets, skippedBlankSheets } = await convertDwg(
+      buffer,
+      TEST_CONFIG,
+      {},
+      { read: () => ({ version: "AC1027", document }) }
+    );
+
+    // Draw order is preserved and the blank layout is gone, so only the drawn
+    // layout and the model sheet survive.
+    expect(sheets).toHaveLength(2);
+    expect(sheets.map((s) => s.viewName)).toEqual(["Dense", "Model"]);
+    for (const sheet of sheets) {
+      expect(sheet.png.byteLength).toBeGreaterThan(0);
+    }
+    // Only the layout framing empty model space is dropped.
+    expect(skippedBlankSheets).toEqual(["Sparse"]);
+  });
+
+  it("rejects a DWG whose every sheet is blank", async () => {
+    // Model space is empty and the single layout draws only a title-block
+    // frame, so nothing reaches the ink threshold.
+    const border = new Line();
+    border.startPoint = new XYZ(10, 10, 0);
+    border.endPoint = new XYZ(390, 290, 0);
+
+    const viewport = new Viewport();
+    viewport.id = 2;
+    viewport.center = new XYZ(200, 150, 0);
+    viewport.width = 380;
+    viewport.height = 280;
+    viewport.viewCenter = new XY(500, 500);
+    viewport.viewHeight = 100;
+
+    const document = {
+      layers: [],
+      blockRecords: [],
+      modelSpace: { entities: [] },
+      paperSpace: { entities: [border, viewport] },
+    } as unknown as CadDocument;
+
+    const buffer = new TextEncoder().encode("AC1027 all blank").buffer as ArrayBuffer;
+
+    await expect(
+      convertDwg(buffer, TEST_CONFIG, {}, { read: () => ({ version: "AC1027", document }) })
+    ).rejects.toMatchObject({ code: "NO_DRAWABLE_CONTENT" });
   });
 });
