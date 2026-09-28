@@ -1,6 +1,9 @@
 "use client";
 
-import type { ConversionResult as ConversionResultData } from "@/types/conversion";
+import type {
+  ConversionResult as ConversionResultData,
+  OmittedSheet,
+} from "@/types/conversion";
 import { Button } from "@/components/ui/button";
 import DwgUploader from "@/components/DwgUploader";
 import ConversionProgress, { type ProgressStep } from "@/components/ConversionProgress";
@@ -15,7 +18,7 @@ interface ConverterCardProps {
   uploadProgress?: number | null;
   error: string | null;
   results: ConversionResultData[] | null;
-  skippedBlankSheets?: string[];
+  omittedBlankSheets?: OmittedSheet[];
   maxMb: number;
   onFile: (file: File) => void;
   onClear: () => void;
@@ -31,7 +34,7 @@ export default function ConverterCard({
   uploadProgress,
   error,
   results,
-  skippedBlankSheets,
+  omittedBlankSheets,
   maxMb,
   onFile,
   onClear,
@@ -102,7 +105,7 @@ export default function ConverterCard({
         {results && results.length > 0 && (
           <ConversionResult
             results={results}
-            skippedBlankSheets={skippedBlankSheets}
+            omittedBlankSheets={omittedBlankSheets}
             onReset={onReset}
           />
         )}

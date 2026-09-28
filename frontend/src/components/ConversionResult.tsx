@@ -18,20 +18,34 @@ import {
   Sparkles,
   LayoutGrid,
 } from "lucide-react";
-import type { ConversionResult as ConversionResultData } from "@/types/conversion";
+import type {
+  BlankSheetReason,
+  ConversionResult as ConversionResultData,
+  OmittedSheet,
+} from "@/types/conversion";
 
 import { cn } from "cn";
 import { Button } from "@/components/ui/button";
 import ImagePreviewCard from "@/components/ImagePreviewCard";
 import ImageLightbox from "@/components/ImageLightbox";
 
+/** Plain-language label per drop reason, shown in the omission note. */
+const OMITTED_REASON_LABEL: Record<BlankSheetReason, string> = {
+  "no-drawing": "nothing drawn",
+  "too-little-detail": "too little detail",
+};
+
+function describeOmitted(sheet: OmittedSheet): string {
+  return `${sheet.name} (${OMITTED_REASON_LABEL[sheet.reason]})`;
+}
+
 interface ConversionResultProps {
   results: ConversionResultData[];
-  skippedBlankSheets?: string[];
+  omittedBlankSheets?: OmittedSheet[];
   onReset: () => void;
 }
 
-export default function ConversionResult({ results, skippedBlankSheets = [], onReset }: ConversionResultProps) {
+export default function ConversionResult({ results, omittedBlankSheets = [], onReset }: ConversionResultProps) {
   const [selectedId, setSelectedId] = useState<string | null>(results[0]?.conversionId ?? null);
   const [generating, setGenerating] = useState(false);
   const [downloadingAi, setDownloadingAi] = useState(false);
@@ -185,11 +199,12 @@ export default function ConversionResult({ results, skippedBlankSheets = [], onR
           <p className="truncate text-[13px] text-muted-foreground">
             {results[0]?.originalFileName} · click a sheet to view it, then generate its AI visualization
           </p>
-          {skippedBlankSheets.length > 0 && (
+          {omittedBlankSheets.length > 0 && (
             <p className="text-[12px] font-medium text-amber-600 dark:text-amber-400">
-              {skippedBlankSheets.length} blank sheet{skippedBlankSheets.length === 1 ? " was" : "s were"}{" "}
-              omitted: {skippedBlankSheets.slice(0, 3).join(", ")}
-              {skippedBlankSheets.length > 3 ? "…" : ""}.
+              {omittedBlankSheets.length} sheet{omittedBlankSheets.length === 1 ? "" : "s"} produced no PNG
+              {omittedBlankSheets.length === 1 ? "" : "s"}: 
+              {omittedBlankSheets.slice(0, 3).map(describeOmitted).join(", ")}
+              {omittedBlankSheets.length > 3 ? "…" : ""}.
             </p>
           )}
         </div>

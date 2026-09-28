@@ -190,7 +190,7 @@ export async function POST(request: NextRequest) {
     );
 
     const started = Date.now();
-    const { sheets: outputs, skippedBlankSheets } = await convertDwg(buffer, config, { info: log });
+    const { sheets: outputs, omittedBlankSheets } = await convertDwg(buffer, config, { info: log });
 
     const usedNames = new Map<string, number>();
     const sheets = outputs.map((output, index) => {
@@ -221,7 +221,7 @@ export async function POST(request: NextRequest) {
         success: true,
         originalFileName,
         sheetCount: sheets.length,
-        skippedBlankSheets,
+        omittedBlankSheets,
         sheets: sheets.map((sheet) => ({
           success: true,
           conversionId: sheet.conversionId,

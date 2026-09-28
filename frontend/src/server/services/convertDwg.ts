@@ -2,6 +2,7 @@ import { createDwgReader, type DwgReaderPort, type RawDwgData } from "./dwgReade
 import { parseViews, type ConversionStatistics, type ParsedView } from "./dwgParser";
 import { renderToSvg, type RenderOptions } from "./renderer";
 import { generatePng, rasterInkFraction } from "./pngGenerator";
+import { partitionRenderable, type OmittedSheet } from "./blankSheet";
 import {
   clusterModelEntities,
   limitClusters,
@@ -251,21 +252,29 @@ export async function renderViewPng(
 
 /**
  * The multi-sheet conversion orchestrator: inspect → select every drawable
- * sheet → render each to a PNG. A sheet whose PNG is effectively empty is
- * dropped rather than emitted, so callers never receive a blank page; the names
- * of dropped sheets come back in `skippedBlankSheets`. A DWG with more
- * renderable paper-space layouts than `config.maxLayouts` is rejected with
- * MULTIPLE_LAYOUTS, and a DWG whose sheets are *all* blank is rejected with
- * NO_DRAWABLE_CONTENT.
+ * sheet → drop the ones that show no drawing → render the rest to PNG.
+ *
+ * Two independent conditions must hold before a sheet becomes a PNG, because
+ * they catch different failures:
+ *
+ * 1. **It shows a drawing** (`hasSheetDrawing`) — for a layout, model geometry
+ *    must land inside one of its viewport windows; for a model crop, the crop
+ *    must hold something other than text and points. A layout whose viewport
+ *    frames empty model space still renders a full page of title-block ink, so
+ *    this is what stops a visually blank sheet from being emitted.
+ * 2. **It clears `config.blankSheetInkFraction`** — a sheet can hold geometry
+ *    yet still render nearly empty, which is a blank page to a reader.
+ *
+ * A sheet failing either test is never rendered to storage; its name and reason
+ * come back in `omittedBlankSheets`. A DWG with more renderable paper-space
+ * layouts than `config.maxLayouts` is rejected with MULTIPLE_LAYOUTS, and a DWG
+ * whose sheets are *all* blank is rejected with NO_DRAWABLE_CONTENT.
  */
 export interface ConvertSummary {
-  /** Every non-blank sheet, in draw order. One entry per renderable layout. */
+  /** Every sheet that passed both tests, in draw order. */
   sheets: ConversionOutput[];
-  /**
-   * Names of sheets whose rendered PNG was blank and therefore omitted. These
-   * are absent from `sheets` and are never persisted.
-   */
-  skippedBlankSheets: string[];
+  /** Every sheet that was dropped, with the reason it was dropped. */
+  omittedBlankSheets: OmittedSheet[];
 }
 
 export async function convertDwg(
@@ -291,19 +300,31 @@ export async function convertDwg(
       ` (${selected.length - modelCount} layout(s), ${modelCount} model crop(s)).`
   );
 
-  const skippedBlankSheets: string[] = [];
+  // The unclustered model space is the source of geometry for the viewport
+  // test; a layout shows model drawing, never its own neighbours' crops.
+  const modelEntities = inspected.views.find((view) => view.isModel)?.drawing.entities ?? [];
+  const { renderable, omitted } = partitionRenderable(selected, modelEntities);
+  assertWithinBudget(deadline, "filtering blank sheets");
+  if (omitted.length > 0) {
+    logger.info?.(
+      `Omitted ${omitted.length} sheet(s) showing no drawing: ` +
+        omitted.map((sheet) => `"${sheet.name}" (${sheet.reason})`).join(", ") +
+        "."
+    );
+  }
+
   const sheets: ConversionOutput[] = [];
-  for (const [index, view] of selected.entries()) {
-    assertWithinBudget(deadline, `rendering sheet ${index + 1} of ${selected.length}`);
+  for (const [index, view] of renderable.entries()) {
+    assertWithinBudget(deadline, `rendering sheet ${index + 1} of ${renderable.length}`);
     const output = await renderViewPng(view, config, logger);
-    assertWithinBudget(deadline, `rasterizing sheet ${index + 1} of ${selected.length}`);
+    assertWithinBudget(deadline, `rasterizing sheet ${index + 1} of ${renderable.length}`);
     const ink = await rasterInkFraction(output.png);
     if (ink < config.blankSheetInkFraction) {
-      skippedBlankSheets.push(view.name);
+      omitted.push({ name: view.name, reason: "too-little-detail" });
       logger.info?.(
         `Sheet "${view.name}" rendered ${(ink * 100).toFixed(2)}% ink (under ${(
           config.blankSheetInkFraction * 100
-        ).toFixed(2)}%); blank, omitted.`
+        ).toFixed(2)}%); too little detail to be worth a PNG, omitted.`
       );
       continue;
     }
@@ -315,19 +336,15 @@ export async function convertDwg(
   }
 
   if (sheets.length === 0) {
-    const names = skippedBlankSheets.join(", ");
-    logger.info?.(`All ${skippedBlankSheets.length} sheet(s) were blank (${names || "none"}).`);
+    logger.info?.(
+      `All ${omitted.length} sheet(s) were blank (${omitted.map((s) => s.name).join(", ") || "none"}).`
+    );
     throw new AppError(
       "NO_DRAWABLE_CONTENT",
-      `Every sheet in this DWG is blank (${skippedBlankSheets.length} checked).`
+      `Every sheet in this DWG is blank (${omitted.length} checked).`
     );
   }
-  if (skippedBlankSheets.length > 0) {
-    logger.info?.(
-      `Omitted ${skippedBlankSheets.length} blank sheet(s): ${skippedBlankSheets.join(", ")}.`
-    );
-  }
-  return { sheets, skippedBlankSheets };
+  return { sheets, omittedBlankSheets: omitted };
 }
 
 function versionFromHeader(raw: { document: { header?: { version?: unknown } | null } }): string | null {

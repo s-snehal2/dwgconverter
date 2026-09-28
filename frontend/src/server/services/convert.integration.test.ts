@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Line, Viewport, XYZ, XY } from "@node-projects/acad-ts";
+import { Line, Point, TextEntity, Viewport, XYZ, XY } from "@node-projects/acad-ts";
 import type { CadDocument } from "@node-projects/acad-ts";
 import { convertDwg } from "./convertDwg";
 import { minimalDwgBytes } from "./testFixture";
@@ -45,9 +45,9 @@ describe("convertDwg integration", () => {
     expect(signature).toBe("AC10");
 
     const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    const { sheets, skippedBlankSheets } = await convertDwg(arrayBuffer, TEST_CONFIG);
+    const { sheets, omittedBlankSheets } = await convertDwg(arrayBuffer, TEST_CONFIG);
     expect(sheets).toHaveLength(1);
-    expect(skippedBlankSheets).toHaveLength(0);
+    expect(omittedBlankSheets).toHaveLength(0);
     const result = sheets[0];
 
     // The grid fixture contributes 200 horizontal + 200 vertical model lines.
@@ -110,7 +110,7 @@ describe("convertDwg integration", () => {
 
     const buffer = new TextEncoder().encode("AC1027 page").buffer as ArrayBuffer;
 
-    const { sheets, skippedBlankSheets } = await convertDwg(
+    const { sheets, omittedBlankSheets } = await convertDwg(
       buffer,
       TEST_CONFIG,
       {},
@@ -120,7 +120,7 @@ describe("convertDwg integration", () => {
     // targets the layout, which is what this test is about.
     expect(sheets).toHaveLength(2);
     expect(sheets.map((s) => s.viewName)).toEqual(["Layout 1", "Model"]);
-    expect(skippedBlankSheets).toHaveLength(0);
+    expect(omittedBlankSheets).toHaveLength(0);
     const result = sheets[0];
 
     expect(result.statistics.page).toEqual({ entityCount: 1, viewportCount: 1 });
@@ -175,18 +175,18 @@ describe("convertDwg integration", () => {
 
     const buffer = new TextEncoder().encode("AC1027 blank page").buffer as ArrayBuffer;
 
-    const { sheets, skippedBlankSheets } = await convertDwg(
+    const { sheets, omittedBlankSheets } = await convertDwg(
       buffer,
       TEST_CONFIG,
       {},
       { read: () => ({ version: "AC1027", document }) }
     );
     // The layout frames empty model space, so the page is blank. It is dropped
-    // entirely: no PNG, no persisted output. The model sheet survives because
-    // model space has its own content.
+    // before rendering: no PNG, no persisted output. The model sheet survives
+    // because model space has its own content.
     expect(sheets).toHaveLength(1);
     expect(sheets[0].viewName).toBe("Model");
-    expect(skippedBlankSheets).toContain("Layout 1");
+    expect(omittedBlankSheets).toEqual([{ name: "Layout 1", reason: "no-drawing" }]);
     expect(sheets[0].png.byteLength).toBeGreaterThan(0);
   });
 
@@ -238,7 +238,7 @@ describe("convertDwg integration", () => {
 
     const buffer = new TextEncoder().encode("AC1027 two layouts").buffer as ArrayBuffer;
 
-    const { sheets, skippedBlankSheets } = await convertDwg(
+    const { sheets, omittedBlankSheets } = await convertDwg(
       buffer,
       TEST_CONFIG,
       {},
@@ -253,7 +253,7 @@ describe("convertDwg integration", () => {
       expect(sheet.png.byteLength).toBeGreaterThan(0);
     }
     // Only the layout framing empty model space is dropped.
-    expect(skippedBlankSheets).toEqual(["Sparse"]);
+    expect(omittedBlankSheets).toEqual([{ name: "Sparse", reason: "no-drawing" }]);
   });
 
   it("rejects a DWG whose every sheet is blank", async () => {
@@ -283,5 +283,207 @@ describe("convertDwg integration", () => {
     await expect(
       convertDwg(buffer, TEST_CONFIG, {}, { read: () => ({ version: "AC1027", document }) })
     ).rejects.toMatchObject({ code: "NO_DRAWABLE_CONTENT" });
+  });
+
+  it("omits a layout whose viewport is empty even when its page ink is dense", async () => {
+    // The regression this whole rule exists for. The page carries a dense
+    // title-block/hatch grid — far more ink than the 0.5% threshold — while the
+    // viewport frames empty model space. An ink-only test keeps this sheet and
+    // hands the user a "blank" page full of title-block furniture; the semantic
+    // test is what drops it.
+    const pageGrid: Line[] = [];
+    for (let y = 10; y <= 290; y += 5) {
+      const line = new Line();
+      line.startPoint = new XYZ(10, y, 0);
+      line.endPoint = new XYZ(390, y, 0);
+      pageGrid.push(line);
+    }
+    for (let x = 10; x <= 390; x += 5) {
+      const line = new Line();
+      line.startPoint = new XYZ(x, 10, 0);
+      line.endPoint = new XYZ(x, 290, 0);
+      pageGrid.push(line);
+    }
+
+    const makeViewport = (viewCenterX: number, viewCenterY: number) => {
+      const vp = new Viewport();
+      vp.id = 2;
+      vp.center = new XYZ(200, 150, 0);
+      vp.width = 380;
+      vp.height = 280;
+      vp.viewCenter = new XY(viewCenterX, viewCenterY);
+      vp.viewHeight = 100;
+      return vp;
+    };
+
+    const modelGrid: Line[] = [];
+    for (let i = 0; i <= 100; i += 2) {
+      for (const [x1, y1, x2, y2] of [
+        [0, i, 100, i],
+        [i, 0, i, 100],
+      ] as [number, number, number, number][]) {
+        const line = new Line();
+        line.startPoint = new XYZ(x1, y1, 0);
+        line.endPoint = new XYZ(x2, y2, 0);
+        modelGrid.push(line);
+      }
+    }
+
+    const withViewportAt = (viewCenterX: number, viewCenterY: number) =>
+      ({
+        layers: [],
+        blockRecords: [],
+        modelSpace: { entities: modelGrid },
+        paperSpace: { entities: [...pageGrid, makeViewport(viewCenterX, viewCenterY)] },
+      }) as unknown as CadDocument;
+
+    const run = (document: CadDocument) =>
+      convertDwg(
+        new TextEncoder().encode("AC1027 dense page").buffer as ArrayBuffer,
+        TEST_CONFIG,
+        {},
+        { read: () => ({ version: "AC1027", document }) }
+      );
+
+    // Same dense page, viewport framing the populated model region: kept.
+    const drawn = await run(withViewportAt(50, 50));
+    expect(drawn.sheets.map((s) => s.viewName)).toEqual(["Layout 1", "Model"]);
+    expect(drawn.omittedBlankSheets).toHaveLength(0);
+
+    // Same dense page, viewport framing empty model space: dropped. Ink is
+    // identical in both runs, so the page furniture cannot be the deciding
+    // factor — only the emptiness of the window is.
+    const empty = await run(withViewportAt(500, 500));
+    expect(empty.sheets.map((s) => s.viewName)).toEqual(["Model"]);
+    expect(empty.omittedBlankSheets).toEqual([{ name: "Layout 1", reason: "no-drawing" }]);
+  });
+
+  it("omits a sheet that shows geometry but renders too little detail", async () => {
+    // Exercises the second stage. A sparse cluster of three lines far from the
+    // main grid, framed by a viewport at a scale where it covers a sliver of the
+    // page: the sheet *does* show a drawing, so the semantic test passes, but
+    // the render falls under the ink threshold and is dropped anyway.
+    const modelGrid: Line[] = [];
+    for (let i = 0; i <= 100; i += 2) {
+      for (const [x1, y1, x2, y2] of [
+        [0, i, 100, i],
+        [i, 0, i, 100],
+      ] as [number, number, number, number][]) {
+        const line = new Line();
+        line.startPoint = new XYZ(x1, y1, 0);
+        line.endPoint = new XYZ(x2, y2, 0);
+        modelGrid.push(line);
+      }
+    }
+    // A small, self-contained cluster 5,000 units away.
+    for (const [x1, y1, x2, y2] of [
+      [5000, 5000, 5010, 5000],
+      [5010, 5000, 5010, 5010],
+      [5010, 5010, 5000, 5010],
+    ] as [number, number, number, number][]) {
+      const line = new Line();
+      line.startPoint = new XYZ(x1, y1, 0);
+      line.endPoint = new XYZ(x2, y2, 0);
+      modelGrid.push(line);
+    }
+
+    const viewport = new Viewport();
+    viewport.id = 2;
+    viewport.center = new XYZ(200, 150, 0);
+    viewport.width = 380;
+    viewport.height = 280;
+    // A wide window (viewHeight 200) shrinks the far cluster to a sliver.
+    viewport.viewCenter = new XY(5005, 5005);
+    viewport.viewHeight = 200;
+
+    const document = {
+      layers: [],
+      blockRecords: [],
+      modelSpace: { entities: modelGrid },
+      paperSpace: { entities: [viewport] },
+    } as unknown as CadDocument;
+
+    const { sheets, omittedBlankSheets } = await convertDwg(
+      new TextEncoder().encode("AC1027 sparse sheet").buffer as ArrayBuffer,
+      TEST_CONFIG,
+      {},
+      { read: () => ({ version: "AC1027", document }) }
+    );
+
+    // Both model crops survive (each is zoomed to its own content); the layout
+    // that showed only a sliver does not.
+    expect(sheets.map((s) => s.viewName)).toEqual(["Model", "Model 2"]);
+    expect(omittedBlankSheets).toEqual([{ name: "Layout 1", reason: "too-little-detail" }]);
+  });
+
+  it("produces no PNG when a model space holds nothing but a stray point", async () => {
+    // A lone point renders as a sub-pixel dot, so a crop of one is a blank page
+    // by any reading: no drawing, therefore no PNG, therefore a 422 rather than
+    // an empty result set.
+    const stray = new Point();
+    stray.location = new XYZ(50, 50, 0);
+
+    const document = {
+      layers: [],
+      blockRecords: [],
+      modelSpace: { entities: [stray] },
+    } as unknown as CadDocument;
+
+    await expect(
+      convertDwg(
+        new TextEncoder().encode("AC1027 stray point").buffer as ArrayBuffer,
+        TEST_CONFIG,
+        {},
+        { read: () => ({ version: "AC1027", document }) }
+      )
+    ).rejects.toMatchObject({ code: "NO_DRAWABLE_CONTENT" });
+  });
+
+  it("omits a model crop of only text while keeping the drawn crop", async () => {
+    // A note in one corner and a real drawing elsewhere. The note's crop is not
+    // a drawing, so it yields no PNG; the drawing's crop is unaffected. Two
+    // notes, not one: the clusterer folds an isolated entity into its
+    // neighbour, so a single note would never form a crop of its own.
+    const makeNote = (x: number, y: number) => {
+      const note = new TextEntity("SITE NOTE");
+      note.insertPoint = new XYZ(x, y, 0);
+      note.height = 2.5;
+      note.rotation = 0;
+      return note;
+    };
+
+    const grid: Line[] = [];
+    for (let i = 0; i <= 100; i += 2) {
+      for (const [x1, y1, x2, y2] of [
+        [0, i, 100, i],
+        [i, 0, i, 100],
+      ] as [number, number, number, number][]) {
+        const line = new Line();
+        line.startPoint = new XYZ(x1, y1, 0);
+        line.endPoint = new XYZ(x2, y2, 0);
+        grid.push(line);
+      }
+    }
+
+    const document = {
+      layers: [],
+      blockRecords: [],
+      modelSpace: { entities: [makeNote(5000, 5000), makeNote(5000, 5010), ...grid] },
+    } as unknown as CadDocument;
+
+    const { sheets, omittedBlankSheets } = await convertDwg(
+      new TextEncoder().encode("AC1027 note crop").buffer as ArrayBuffer,
+      TEST_CONFIG,
+      {},
+      { read: () => ({ version: "AC1027", document }) }
+    );
+
+    // Only the grid crop survives; the crop of the two notes is dropped, and
+    // which crop the clusterer names first is not something to assert on.
+    expect(sheets).toHaveLength(1);
+    expect(sheets[0].statistics.totalEntities).toBe(102);
+    expect(omittedBlankSheets).toHaveLength(1);
+    expect(omittedBlankSheets[0].reason).toBe("no-drawing");
+    expect(omittedBlankSheets[0].name).not.toBe(sheets[0].viewName);
   });
 });

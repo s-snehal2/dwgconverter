@@ -3,7 +3,10 @@
 import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 import ConverterCard from "@/components/ConverterCard";
-import type { ConversionResult as ConversionResultData } from "@/types/conversion";
+import type {
+  ConversionResult as ConversionResultData,
+  OmittedSheet,
+} from "@/types/conversion";
 import type { ProgressStep } from "@/components/ConversionProgress";
 import { convertDwgFile } from "@/services/api";
 
@@ -19,7 +22,7 @@ export default function Home() {
   const [step, setStep] = useState<ProgressStep>("upload");
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<ConversionResultData[] | null>(null);
-  const [skippedBlankSheets, setSkippedBlankSheets] = useState<string[]>([]);
+  const [omittedBlankSheets, setOmittedBlankSheets] = useState<OmittedSheet[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -33,7 +36,7 @@ export default function Home() {
     setStep("upload");
     setError(null);
     setResults(null);
-    setSkippedBlankSheets([]);
+    setOmittedBlankSheets([]);
     setUploadProgress(null);
   }, []);
 
@@ -98,7 +101,7 @@ export default function Home() {
       });
       setStep("render");
       setResults(converted.sheets);
-      setSkippedBlankSheets(converted.skippedBlankSheets ?? []);
+      setOmittedBlankSheets(converted.omittedBlankSheets ?? []);
       setStep("done");
       toast.success(
         converted.sheets.length > 1
@@ -133,7 +136,7 @@ export default function Home() {
         uploadProgress={uploadProgress}
         error={error}
         results={results}
-        skippedBlankSheets={skippedBlankSheets}
+        omittedBlankSheets={omittedBlankSheets}
         maxMb={MAX_MB}
         onFile={selectFile}
         onClear={clearFile}

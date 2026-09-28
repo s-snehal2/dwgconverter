@@ -64,7 +64,7 @@ interface ConvertResultBody {
   success: boolean;
   originalFileName: string;
   sheetCount: number;
-  skippedBlankSheets?: string[];
+  omittedBlankSheets?: { name: string; reason: string }[];
   sheets: SheetBody[];
 }
 
@@ -87,7 +87,7 @@ describe("POST /api/convert — direct multipart upload", () => {
     expect(body.originalFileName).toBe("drawing.dwg");
     expect(body.sheetCount).toBe(1);
     expect(body.sheets).toHaveLength(1);
-    expect(body.skippedBlankSheets).toEqual([]);
+    expect(body.omittedBlankSheets).toEqual([]);
 
     const sheet = body.sheets[0]!;
     expect(/^[0-9a-f-]{36}$/.test(sheet.conversionId)).toBe(true);

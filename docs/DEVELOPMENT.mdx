@@ -207,12 +207,13 @@ On every `POST /api/convert`:
 ```ts
 const inspected = await inspectDwg(arrayBuffer, logger, overrides);
 const views = selectViewsForConversion(inspected.views, config.maxLayouts);
+const modelEntities = inspected.views.find((v) => v.isModel)?.drawing.entities ?? [];
+const { renderable, omitted } = partitionRenderable(views, modelEntities);  // stage 1
 const sheets = [];
-const skippedBlankSheets = [];           // blank sheets are dropped, not emitted
-for (const view of views) {
+for (const view of renderable) {
   const output = await renderViewPng(view, config, logger);
   if ((await rasterInkFraction(output.png)) < config.blankSheetInkFraction) {
-    skippedBlankSheets.push(view.name);
+    omitted.push({ name: view.name, reason: "too-little-detail" });   // stage 2
     continue;                           // never reaches saveOutput()
   }
   sheets.push(output);
@@ -244,19 +245,44 @@ if (sheets.length === 0) throw new AppError("NO_DRAWABLE_CONTENT", "…");
   (≥ 15,000 normalized entities) the supersample is disabled
   (`supersampleForEntities`) — a 6000px canvas with tens of thousands of
   entities would otherwise be disproportionately slow.
-- **Blank sheets are dropped** — `rasterInkFraction` measures ink coverage on
-  the rendered PNG. A sheet under `blankSheetInkFraction`
-  (`BLANK_SHEET_INK_FRACTION`, default 0.005 = half a percent of the page) is
-  recorded in `skippedBlankSheets` and **not** returned in `sheets`, so it is
-  never rasterized to storage, never downloaded, and never offered to the AI
-  step. The UI shows a "N blank sheets were omitted" note listing the names.
-  The threshold is deliberately low so a real but sparse plan is kept; the
-  trade-off is that it is fixed at request time, so a drawing lost in production
-  is corrected by setting the env var rather than a redeploy. This applies to
-  model crops as well as layouts — a whitespace-only cluster is exactly the
-  case worth dropping. If *every* sheet is blank, the conversion is rejected
-  with `NO_DRAWABLE_CONTENT` (422) rather than returning an empty result the UI
-  cannot render.
+- **Blank sheets are dropped, in two stages** — the rule is *no drawing, no PNG*,
+  and each stage catches a failure the other cannot.
+
+  1. **Does the sheet show a drawing?** (`blankSheet.hasSheetDrawing`, run
+     *before* rendering, so a rejected sheet costs no pixels). A paper-space
+     layout is blank when it has no usable viewport, or when no model geometry
+     lands inside any of its viewport windows. Model entities are projected with
+     `modelToPagePoint` — which already handles viewport twist — and tested
+     against the page rect; entities on a layer in `frozenLayers` are skipped
+     because they render as nothing. A model crop is blank when it holds nothing
+     but `TEXT`/`MTEXT`/`POINT`. Only `DRAWING_ENTITY_TYPES` (`LINE`, `CIRCLE`,
+     `ARC`, `ELLIPSE`, `POLYLINE`, `SOLID`, `IMAGE`) count as a drawing: a note
+     or a stray point renders as almost nothing and reads as blank.
+
+     This stage exists because a layout whose viewport frames empty model space
+     still renders a *page* full of border, title block and hatch ink, which is
+     exactly what a blank sheet looks like. Ink cannot tell the two apart; the
+     viewport geometry can. The test projects all four bounds corners and
+     over-approximates, erring toward keeping a sheet — a false keep leaves a
+     blank page, a false drop would lose a real drawing. A prefilter on the
+     unrotated model-space bounds keeps the cost negligible.
+
+  2. **Does the render clear the ink threshold?** `rasterInkFraction` measures
+     ink coverage on the rendered PNG. A sheet under `blankSheetInkFraction`
+     (`BLANK_SHEET_INK_FRACTION`, default 0.005 = half a percent of the page) is
+     dropped, catching a sheet that does hold geometry yet still renders nearly
+     empty.
+
+  A sheet must pass both. Dropped sheets are recorded in `omittedBlankSheets`
+  with a `reason` (`no-drawing` or `too-little-detail`) and **not** returned in
+  `sheets`, so they are never rasterized to storage, never downloaded, and never
+  offered to the AI step. The UI shows an "N sheets produced no PNGs" note
+  listing the names and reasons. The ink threshold is deliberately low so a real
+  but sparse plan is kept; the trade-off is that it is fixed at request time, so
+  a drawing lost in production is corrected by setting the env var rather than a
+  redeploy. If *every* sheet is blank, the conversion is rejected with
+  `NO_DRAWABLE_CONTENT` (422) rather than returning an empty result the UI cannot
+  render.
 - **Two other ways a sheet never becomes a view** — a layout with zero
   entities *and* zero viewports never becomes a view at all:
   `pageFromBlockRecord` (`dwgParser.ts`) returns `null` because there are no
