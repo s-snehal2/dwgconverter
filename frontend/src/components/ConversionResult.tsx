@@ -12,11 +12,12 @@ import {
 
 import {
   Check,
+  Info,
+  LayoutGrid,
   Loader2,
   MonitorSmartphone,
   MousePointerClick,
   Sparkles,
-  LayoutGrid,
 } from "lucide-react";
 import type {
   BlankSheetReason,
@@ -283,20 +284,22 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
           <span className="h-px flex-1 bg-border/60" />
         </div>
 
+        <p className="mb-2 flex items-center gap-1.5 px-1 pb-1 text-[11px] text-muted-foreground">
+          <Info className="size-3.5 shrink-0" />
+          AI-generated preview. It may not be 100% accurate or exactly match your drawing — for reference only.
+        </p>
+
         <div className="space-y-2.5">
           {!selected ? (
             <p className="px-1 text-center text-sm text-muted-foreground">
               No sheet selected.
             </p>
-          ) : (
+) : (
             <>
               <div className="rounded-xl border border-border/70 bg-card/60 p-3">
                 <p className="mb-1 flex items-center gap-1.5 text-[13px] font-medium text-foreground">
                   <Sparkles className="size-3.5 text-amber-500" />
-                  “{selected.sheetName ?? selected.fileName}”
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  AI visualization is generated with the standard room styling prompt.
+                  &ldquo;{selected.sheetName ?? selected.fileName}&rdquo;
                 </p>
               </div>
 

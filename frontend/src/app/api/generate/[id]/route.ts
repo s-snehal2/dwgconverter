@@ -1,9 +1,18 @@
 import type { NextRequest } from "next/server";
 import { getConfig } from "@/server/config";
 import { generateDrawingImage } from "@/server/services/geminiImage";
-import { sweepExpiredOutputs, readOutput, saveAiOutput, getAiGenerationCount, incrementAiGenerationCount } from "@/server/services/outputStore";
+import {
+  sweepExpiredOutputsThrottled,
+  readOutput,
+  saveAiOutput,
+  saveCacheAiImage,
+  readCacheAiImage,
+  getAiGenerationCount,
+  incrementAiGenerationCount,
+} from "@/server/services/outputStore";
 import { toAppError, AppError, httpStatusForCode, userMessageForCode } from "@/server/utils/errors";
 import { isSafeConversionId } from "@/server/utils/storage";
+import { sha256Hex } from "@/server/utils/hash";
 import { takeRateLimit } from "@/server/utils/rateLimit";
 
 export const runtime = "nodejs";
@@ -72,7 +81,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
   // Best-effort periodic cleanup of expired outputs.
   try {
-    await sweepExpiredOutputs(config.cleanupAgeMs);
+    await sweepExpiredOutputsThrottled(config.cleanupAgeMs);
   } catch (err) {
     log(`Cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -94,9 +103,36 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   }
 
   const baseName = stored.fileName.replace(/\.png$/i, "");
+  const png = stored.buffer;
+
+  const hash = sha256Hex(png);
+  try {
+    const cached = await readCacheAiImage(hash);
+    if (cached) {
+      const fileName = cached.fileName || `${baseName}-ai.png`;
+      await saveAiOutput(id, cached.buffer, fileName);
+      log(
+        `Cache hit for ${hash}: reusing earlier AI image (${cached.buffer.byteLength} bytes) without calling Gemini.`
+      );
+      return Response.json(
+        {
+          success: true,
+          conversionId: id,
+          fileName,
+          size: cached.buffer.byteLength,
+          durationMs: 0,
+          generationsUsed: usedSoFar,
+          generationsLimit: config.aiGenerationLimit,
+          cached: true,
+        },
+        { status: 200 },
+      );
+    }
+  } catch (err) {
+    log(`Cache lookup failed, generating fresh: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   try {
-    const png = stored.buffer;
     log(`Sending ${id}.png (${png.byteLength} bytes) to Gemini for AI generation.`);
 
     const { image, durationMs } = await generateDrawingImage(png, config, userPrompt);
@@ -105,6 +141,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const fileName = `${baseName}-ai.png`;
     await saveAiOutput(id, image, fileName);
     const generationsUsed = await incrementAiGenerationCount(id);
+    try {
+      await saveCacheAiImage(hash, image, fileName);
+    } catch (cacheErr) {
+      log(`Cache write failed (non-fatal): ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}`);
+    }
     log(`AI image written to ${id}.ai.png (generation ${generationsUsed}/${config.aiGenerationLimit}).`);
 
     return Response.json(

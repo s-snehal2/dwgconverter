@@ -6,8 +6,7 @@
     "dev": "node scripts/with-heap.mjs next dev",
     "build": "node scripts/with-heap.mjs next build",
     "start": "node scripts/with-heap.mjs next start",
-    "lint": "eslint",
-    "test": "vitest run"
+    "lint": "eslint"
   },
   "dependencies": {
     "@node-projects/acad-ts": "^3.1.0",
@@ -33,8 +32,6 @@
     "eslint": "^9",
     "eslint-config-next": "16.3.4",
     "tailwindcss": "^4",
-    "typescript": "^5",
-    "vite": "^8.2.2",
-    "vitest": "^5.0.0"
+    "typescript": "^5"
   }
 }

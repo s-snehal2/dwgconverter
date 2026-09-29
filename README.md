@@ -92,12 +92,14 @@ Every value has a safe default, so you only need to change what matters to you:
 | `MAX_LAYOUTS` | `1` | Maximum paper-space layouts accepted; more single-sheet rejections |
 | `MAX_PNG_DIMENSION` | `3000` | Max output width/height in px |
 | `MARGIN_PX` | `50` | Padding around the drawing, in px |
-| `CLEANUP_AGE_MINUTES` | `1440` | Age after which temp files are swept |
+| `CLEANUP_AGE_MINUTES` | `43200` | Age after which converted outputs are swept (default 30 days); results stay downloadable for that window, storage grows with conversion volume |
+| `CACHE_AGE_MINUTES` | `43200` | AI-image cache retention (default 30 days): re-uploading the same drawing reuses its earlier generated image instead of calling Gemini |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Per-IP convert requests/minute |
 | `COLOR_MODE` | *(unset)* | Set to `color` for colored (layer-based) output; default is monochrome |
 | `GEMINI_API_KEY` | *(empty)* | Google AI API key; when set, enables AI image generation via Gemini 3.1 Flash (Nano Banana 2) |
 | `GEMINI_MODEL` | `gemini-3.1-flash-image` | Gemini model id used for AI image generation |
 | `GEMINI_PROMPT` | *(built-in)* | Static prompt sent to Gemini for architectural visualization; see `src/server/config.ts` for the default |
+| `AI_GENERATION_LIMIT` | `3` | Max AI image generations per converted drawing; cache hits do not consume a generation |
 
 > Note: `GEMINI_PROMPT` is optional. Leaving it empty uses the built-in
 > architectural-visualization prompt, so you never need to paste the full text
@@ -110,7 +112,42 @@ Start from the template: `cp frontend/.env.example frontend/.env`
 
 Output files are download-safe: `/api/download/[id]` serves the PNG multiple
 times (no deletion on download) and temp files are swept after
-`CLEANUP_AGE_MINUTES` (default 24 hours).
+`CLEANUP_AGE_MINUTES` (default 30 days).
+
+### Reusing generated images (AI cache)
+
+When a user converts a drawing they've converted before and clicks **Generate AI
+image**, the app does not call Gemini again. The converted PNG is hashed
+(SHA-256) and looked up in a cache; a hit replays the earlier generated image
+instantly (response includes `cached: true`, and it does not consume a
+generation). Cached images live under a separate `cache/` namespace and expire
+after `CACHE_AGE_MINUTES` (default 30 days). Storage grows with the number of
+*unique* drawings seen within that window (~1–2 MB each), so on Vercel's free
+Blob allowance keep the volume of unique drawings moderate or lower
+`CACHE_AGE_MINUTES`.
+
+### Keeping Vercel Blob under its free limit
+
+On Vercel the converted PNGs, AI images, the AI-image cache and sidecars are
+stored in Vercel Blob (switched on when `BLOB_READ_WRITE_TOKEN`/`BLOB_STORE_ID`
+is set). Outputs expire once they are older than
+`CLEANUP_AGE_MINUTES`; a throttled sweep runs opportunistically on
+`/api/convert`, `/api/generate`, `/api/download` and `/api/download-ai`, plus a
+guaranteed daily pass from the Vercel Cron job in `vercel.json` that also ages
+out cached AI images older than `CACHE_AGE_MINUTES`.
+
+So old outputs are removed proactively, not only by coincidence:
+
+1. **One-off purge** (reclaim space immediately, e.g. after hitting 100%):
+   from `frontend/`, run
+   `$env:BLOB_READ_WRITE_TOKEN = "<token>"` then
+   `node scripts/cleanup-blobs.mjs` (add `--older-than-minutes 43200` or `--all`
+   to widen the net — see the script header).
+2. **Daily cron** — deploy the app to **production**; on Hobby the `0 4 * * *`
+   job runs once per day within the 04:00–04:59 UTC window. Set a
+   `CRON_SECRET` environment variable on Vercel (≥16 random chars); the cron
+   calls `/api/cleanup` with it as a bearer token and anything else gets a 401.
+   Note that schedules more frequent than daily fail to deploy on Hobby.
 
 ## Run it
 
@@ -137,16 +174,6 @@ Temporary uploads/outputs go to `frontend/temp/` by default (`TEMP_DIR=./temp`),
 and the same API endpoints are used (`/api/convert`, `/api/generate/[id]`,
 `/api/download/[id]`, `/api/download-ai/[id]`).
 
-## Test
-
-```bash
-cd frontend
-npm test             # vitest: unit + integration
-```
-
-The integration test builds a real DWG (`DXF → acad-ts DwgWriter`) and asserts
-the PNG magic bytes and dimensions.
-
 ## Project structure
 
 ```
@@ -156,11 +183,11 @@ dwg2png/
 └── frontend/
     ├── .env.example              # template (copy + edit)
     ├── next.config.ts            # serverExternalPackages for sharp + acad-ts
-    ├── vitest.config.mts         # vitest config (node env, @ alias)
     └── src/
         ├── app/
         │   ├── page.tsx                     # the conversion screen
         │   ├── api/convert/route.ts         # POST: DWG → PNG + conversionId
+        │   ├── api/cleanup/route.ts         # GET: Vercel Cron sweep of expired outputs
         │   ├── api/generate/[id]/route.ts   # POST: DWG PNG → AI photorealistic image (Gemini)
         │   ├── api/download/[id]/route.ts   # GET: one-shot PNG download
         │   └── api/download-ai/[id]/route.ts # GET: Gemini AI image download

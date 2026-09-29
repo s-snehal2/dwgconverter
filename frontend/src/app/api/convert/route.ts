@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { getConfig, ensureTempDirs } from "@/server/config";
 import type { AppConfig } from "@/server/config";
 import { convertDwg } from "@/server/services/convertDwg";
-import { sweepExpiredOutputs, saveOutput } from "@/server/services/outputStore";
+import { sweepExpiredOutputsThrottled, saveOutput } from "@/server/services/outputStore";
 import { deleteUploadBlob, isTrustedUploadUrl, readUploadBlob } from "@/server/services/uploadStore";
 import { validateExtension, validateFileSize } from "@/server/utils/fileValidation";
 import { toAppError, userMessageForCode, httpStatusForCode } from "@/server/utils/errors";
@@ -152,7 +152,7 @@ export async function POST(request: NextRequest) {
   const config = getConfig();
 
   try {
-    const removed = await sweepExpiredOutputs(config.cleanupAgeMs);
+    const removed = await sweepExpiredOutputsThrottled(config.cleanupAgeMs);
     if (removed > 0) {
       log(`Cleanup removed ${removed} expired temporary file(s).`);
     }

@@ -1,5 +1,6 @@
 import { put, get, list, del } from "@vercel/blob";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { getConfig, ensureTempDirs } from "@/server/config";
 import { sweepTempDirs } from "@/server/services/fileCleanup";
 import { outputPath, aiOutputPath, writeBufferFileAtomic } from "@/server/utils/storage";
@@ -189,6 +190,114 @@ function parseCount(stored: string | null): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+const CACHE_PREFIX = "cache/";
+
+export interface CachedAiImage {
+  buffer: Buffer;
+  fileName: string;
+}
+
+function cacheAiImagePath(hash: string): string {
+  return `${CACHE_PREFIX}${hash}.ai.png`;
+}
+
+function cacheMetaPath(hash: string): string {
+  return `${CACHE_PREFIX}${hash}.meta`;
+}
+
+function cacheMetaString(fileName: string): string {
+  return JSON.stringify({ fileName, createdAt: Date.now() });
+}
+
+function parseCacheMeta(stored: string | null): Pick<CachedAiImage, "fileName"> | null {
+  if (!stored) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(stored) as { fileName?: unknown };
+    return typeof parsed.fileName === "string" && parsed.fileName
+      ? { fileName: parsed.fileName }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist an AI image in the long-lived cache, keyed by the sha256 of the
+ * converted PNG. Stored under a dedicated `cache/` namespace so the
+ * short-lived output sweep (CLEANUP_AGE_MINUTES) never touches it.
+ */
+export async function saveCacheAiImage(hash: string, png: Uint8Array, fileName: string): Promise<void> {
+  if (isBlobEnabled()) {
+    await putBlob(cacheAiImagePath(hash), Buffer.from(png), "image/png");
+    await putBlob(cacheMetaPath(hash), cacheMetaString(fileName), "application/json");
+    return;
+  }
+  const config = getConfig();
+  ensureTempDirs(config);
+  writeBufferFileAtomic(join(config.cacheDir, `${hash}.ai.png`), png);
+  writeFileSync(join(config.cacheDir, `${hash}.meta`), cacheMetaString(fileName), "utf8");
+}
+
+/** Read a cached AI image. Returns null when there is no cached result yet. */
+export async function readCacheAiImage(hash: string): Promise<CachedAiImage | null> {
+  if (isBlobEnabled()) {
+    const buffer = await readBlob(cacheAiImagePath(hash));
+    if (!buffer) {
+      return null;
+    }
+    const meta = parseCacheMeta(await readBlobText(cacheMetaPath(hash)));
+    return { buffer, fileName: meta?.fileName ?? "dwg-ai-generation.png" };
+  }
+  const config = getConfig();
+  const abs = join(config.cacheDir, `${hash}.ai.png`);
+  if (!existsSync(abs)) {
+    return null;
+  }
+  let fileName = "dwg-ai-generation.png";
+  try {
+    const meta = parseCacheMeta(readFileSync(join(config.cacheDir, `${hash}.meta`), "utf8"));
+    if (meta) {
+      fileName = meta.fileName;
+    }
+  } catch {
+    // Fall back to the generic name.
+  }
+  return { buffer: readFileSync(abs), fileName };
+}
+
+/**
+ * Age-based sweep of the AI-image cache. Uses upload/mtime so the cached
+ * images naturally age out after CACHE_AGE_MINUTES.
+ */
+export async function sweepExpiredCache(olderThanMs: number): Promise<number> {
+  if (isBlobEnabled()) {
+    const now = Date.now();
+    const expired: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await list({
+        prefix: CACHE_PREFIX,
+        limit: 1000,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const blob of page.blobs) {
+        if (now - blob.uploadedAt.getTime() > olderThanMs) {
+          expired.push(blob.url);
+        }
+      }
+      cursor = page.hasMore ? page.cursor : undefined;
+    } while (cursor);
+    if (expired.length > 0) {
+      await del(expired);
+    }
+    return expired.length;
+  }
+  const config = getConfig();
+  return sweepTempDirs([config.cacheDir], olderThanMs);
+}
+
 /** Age-based sweep of expired outputs (uploads + outputs). Best-effort. */
 export async function sweepExpiredOutputs(olderThanMs: number): Promise<number> {
   if (isBlobEnabled()) {
@@ -224,4 +333,32 @@ async function sweepExpiredBlobs(olderThanMs: number): Promise<number> {
     await del(expired);
   }
   return expired.length;
+}
+
+/**
+ * Throttle sweeps on the per-request hot path: the Blob sweep scans every
+ * blob, so cap it at most once per 10 minutes per process. The daily cron
+ * (which uses the unthrottled functions) still guarantees a full pass.
+ */
+const SWEEP_MIN_INTERVAL_MS = 10 * 60 * 1000;
+const lastSweepByKind: Record<string, number> = {};
+
+async function throttledSweep(kind: string, fn: () => Promise<number>): Promise<number> {
+  const now = Date.now();
+  if (now - (lastSweepByKind[kind] ?? 0) < SWEEP_MIN_INTERVAL_MS) {
+    return 0;
+  }
+  const removed = await fn();
+  lastSweepByKind[kind] = Date.now();
+  return removed;
+}
+
+/** Throttled variant of sweepExpiredOutputs (≤ once per 10 minutes). */
+export function sweepExpiredOutputsThrottled(olderThanMs: number): Promise<number> {
+  return throttledSweep("outputs", () => sweepExpiredOutputs(olderThanMs));
+}
+
+/** Throttled variant of sweepExpiredCache (≤ once per 10 minutes). */
+export function sweepExpiredCacheThrottled(olderThanMs: number): Promise<number> {
+  return throttledSweep("cache", () => sweepExpiredCache(olderThanMs));
 }

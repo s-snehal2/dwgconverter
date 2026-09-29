@@ -19,7 +19,7 @@ const plexMono = IBM_Plex_Mono({
 export const metadata: Metadata = {
   title: "DWG → PNG Converter",
   description:
-    "Convert a DWG file to a PNG image. Runs entirely on your own machine — nothing is sent to third parties.",
+    "Convert a DWG file to a PNG image, generate an AI visualization of your drawing, and preview it in the TilesView visualizer.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

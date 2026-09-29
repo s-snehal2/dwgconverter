@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { getConfig } from "@/server/config";
-import { readAiOutput, sweepExpiredOutputs } from "@/server/services/outputStore";
+import { readAiOutput, sweepExpiredOutputsThrottled } from "@/server/services/outputStore";
 import { httpStatusForCode, userMessageForCode } from "@/server/utils/errors";
 import type { ErrorCode } from "@/server/utils/errors";
 import { isSafeConversionId } from "@/server/utils/storage";
@@ -35,7 +35,7 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
 
   // Best-effort periodic cleanup.
   try {
-    await sweepExpiredOutputs(getConfig().cleanupAgeMs);
+    await sweepExpiredOutputsThrottled(getConfig().cleanupAgeMs);
   } catch {
     // Best-effort.
   }

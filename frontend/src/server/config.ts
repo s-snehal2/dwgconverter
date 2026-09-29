@@ -39,6 +39,10 @@ export interface AppConfig {
   tempRootDir: string;
   uploadsDir: string;
   outputsDir: string;
+  /** Directory holding the long-lived AI-image cache ({tempRoot}/cache). */
+  cacheDir: string;
+  /** How long a cached AI image is kept before reuse stops (30 days default). */
+  cacheAgeMs: number;
   rateLimitMax: number;
   /** Gemini API key for AI image generation (empty = AI features disabled). */
   geminiApiKey: string;
@@ -133,6 +137,7 @@ export function getConfig(): AppConfig {
   const tempRootDir = resolveTempRoot();
   const uploadsDir = join(tempRootDir, "uploads");
   const outputsDir = join(tempRootDir, "outputs");
+  const cacheDir = join(tempRootDir, "cache");
   return {
     maxFileSizeBytes: parsePositiveInt(process.env.MAX_FILE_SIZE_MB, 80) * 1024 * 1024,
     conversionBudgetMs: parsePositiveInt(process.env.CONVERSION_BUDGET_MS, 260_000),
@@ -140,20 +145,22 @@ export function getConfig(): AppConfig {
     marginPx: parsePositiveInt(process.env.MARGIN_PX, 50),
     pngSupersample: parsePositiveInt(process.env.PNG_SUPERSAMPLE, 2),
     minStrokePx: parsePositiveFloat(process.env.MIN_STROKE_PX, 1),
-    maxLayouts: parsePositiveInt(process.env.MAX_LAYOUTS, 100),
+maxLayouts: parsePositiveInt(process.env.MAX_LAYOUTS, 100),
     blankSheetInkFraction: parsePositiveFloat(process.env.BLANK_SHEET_INK_FRACTION, 0.005),
     modelClusterGapFraction: parsePositiveFloat(process.env.MODEL_CLUSTER_GAP_FRACTION, 0.03),
     modelClusterMaxDepth: parsePositiveInt(process.env.MODEL_CLUSTER_MAX_DEPTH, 12),
     maxAiPromptChars: parsePositiveInt(process.env.MAX_AI_PROMPT_CHARS, 1000),
-    cleanupAgeMs: parsePositiveInt(process.env.CLEANUP_AGE_MINUTES, 1440) * 60 * 1000,
+    cleanupAgeMs: parsePositiveInt(process.env.CLEANUP_AGE_MINUTES, 30 * 24 * 60) * 60 * 1000,
     tempRootDir,
     uploadsDir,
     outputsDir,
+    cacheDir,
+    cacheAgeMs: parsePositiveInt(process.env.CACHE_AGE_MINUTES, 30 * 24 * 60) * 60 * 1000,
     rateLimitMax: parsePositiveInt(process.env.RATE_LIMIT_PER_MINUTE, 30),
     geminiApiKey: (process.env.GEMINI_API_KEY ?? "").trim(),
     geminiPrompt: (process.env.GEMINI_PROMPT ?? DEFAULT_GEMINI_PROMPT).trim(),
     geminiModel: (process.env.GEMINI_MODEL ?? "gemini-3.1-flash-image").trim(),
-    aiGenerationLimit: parsePositiveInt(process.env.AI_GENERATION_LIMIT, 5),
+    aiGenerationLimit: parsePositiveInt(process.env.AI_GENERATION_LIMIT, 3),
     geminiTimeoutMs: parsePositiveInt(process.env.GEMINI_TIMEOUT_MS, 240_000),
     tilesviewApiUrl: (process.env.TILESVIEW_API_URL ?? "https://tilesview.ai/Provider/app/api-room-planner-data").trim(),
     tilesviewAppKey: (process.env.TILESVIEW_APP_KEY ?? "").trim(),
@@ -168,14 +175,14 @@ export function getConfig(): AppConfig {
 }
 
 /**
- * Ensures the upload/output temp directories exist.
+ * Ensures the upload/output/cache temp directories exist.
  *
  * Best-effort by design: on Vercel the bundle directory is read-only, and the
  * Blob-backed store does not need local files at all, so an unwritable temp
  * root must not take the whole conversion down with an opaque 500.
  */
 export function ensureTempDirs(config: AppConfig): void {
-  for (const dir of [config.uploadsDir, config.outputsDir]) {
+  for (const dir of [config.uploadsDir, config.outputsDir, config.cacheDir]) {
     try {
       mkdirSync(dir, { recursive: true });
     } catch (err) {
