@@ -1,6 +1,7 @@
 import { put, get, list, del } from "@vercel/blob";
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { AppError } from "@/server/utils/errors";
 import { getConfig, ensureTempDirs } from "@/server/config";
 import { sweepTempDirs } from "@/server/services/fileCleanup";
 import { outputPath, aiOutputPath, writeBufferFileAtomic } from "@/server/utils/storage";
@@ -18,7 +19,16 @@ import { outputPath, aiOutputPath, writeBufferFileAtomic } from "@/server/utils/
  */
 
 export function isBlobEnabled(): boolean {
-  return Boolean(process.env.BLOB_READ_WRITE_TOKEN || process.env.BLOB_STORE_ID);
+  return Boolean(process.env.BLOB_READ_WRITE_TOKEN || process.env.VERCEL_OIDC_TOKEN);
+}
+
+/** Display names are clamped so they can never break Content-Disposition. */
+const MAX_SHARED_NAME_LENGTH = 180;
+
+function clampFileName(name: string): string {
+  return name.length > MAX_SHARED_NAME_LENGTH
+    ? name.slice(0, MAX_SHARED_NAME_LENGTH)
+    : name;
 }
 
 const BLOB_PREFIX = "outputs/";
@@ -51,22 +61,60 @@ function aiCountBlobPath(id: string): string {
 }
 
 async function putBlob(pathname: string, body: string | Buffer, contentType: string): Promise<void> {
-  await put(pathname, body, {
-    access: "private",
-    contentType,
-    cacheControlMaxAge: 60,
-    // Re-generating an AI image for the same conversion reuses the same path,
-    // so overwriting must be allowed (the default throws "blob already exists").
-    allowOverwrite: true,
-  });
+  try {
+    await put(pathname, body, {
+      access: "private",
+      contentType,
+      cacheControlMaxAge: 60,
+      // Re-generating an AI image for the same conversion reuses the same path,
+      // so overwriting must be allowed (the default throws "blob already exists").
+      allowOverwrite: true,
+    });
+  } catch (err) {
+    throw storageAppError(err);
+  }
+}
+
+/** Consume a web stream once into a single Buffer (one full-size allocation). */
+async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
 }
 
 async function readBlob(pathname: string): Promise<Buffer | null> {
-  const result = await get(pathname, { access: "private", useCache: false });
-  if (!result || result.statusCode !== 200) {
-    return null;
+  try {
+    const result = await get(pathname, { access: "private", useCache: false });
+    if (!result || result.statusCode !== 200 || !result.stream) {
+      return null;
+    }
+    return await streamToBuffer(result.stream);
+  } catch (err) {
+    throw storageAppError(err);
   }
-  return Buffer.from(await new Response(result.stream).arrayBuffer());
+}
+
+/** Wrap storage failures as retryable errors, never as a generic 500. */
+function storageAppError(err: unknown): AppError {
+  return new AppError(
+    "STORAGE_UNAVAILABLE",
+    err instanceof Error ? err.message : String(err)
+  );
 }
 
 async function readBlobText(pathname: string): Promise<string | null> {
@@ -81,30 +129,32 @@ export interface StoredOutput {
 
 /** Persist a converted PNG plus its display filename. */
 export async function saveOutput(id: string, png: Uint8Array, fileName: string): Promise<void> {
+  const safeName = clampFileName(fileName);
   if (isBlobEnabled()) {
     await putBlob(outputBlobPath(id), Buffer.from(png), "image/png");
-    await putBlob(outputNameBlobPath(id), fileName, "text/plain");
+    await putBlob(outputNameBlobPath(id), safeName, "text/plain");
     return;
   }
   const config = getConfig();
   ensureTempDirs(config);
   const abs = outputPath(config.outputsDir, id);
   writeBufferFileAtomic(abs, png);
-  writeFileSync(`${abs}.name`, fileName, "utf8");
+  writeBufferFileAtomic(`${abs}.name`, Buffer.from(safeName, "utf8"));
 }
 
 /** Persist an AI-generated PNG plus its display filename. */
 export async function saveAiOutput(id: string, png: Uint8Array, fileName: string): Promise<void> {
+  const safeName = clampFileName(fileName);
   if (isBlobEnabled()) {
     await putBlob(aiBlobPath(id), Buffer.from(png), "image/png");
-    await putBlob(aiNameBlobPath(id), fileName, "text/plain");
+    await putBlob(aiNameBlobPath(id), safeName, "text/plain");
     return;
   }
   const config = getConfig();
   ensureTempDirs(config);
   const abs = aiOutputPath(config.outputsDir, id);
   writeBufferFileAtomic(abs, png);
-  writeFileSync(`${abs}.name`, fileName, "utf8");
+  writeBufferFileAtomic(`${abs}.name`, Buffer.from(safeName, "utf8"));
 }
 
 /** Read a converted PNG. Returns null when it no longer exists. */
@@ -118,10 +168,11 @@ export async function readOutput(id: string): Promise<StoredOutput | null> {
     return { buffer, fileName: storedName || "dwg-conversion.png" };
   }
   const abs = outputPath(getConfig().outputsDir, id);
-  if (!existsSync(abs)) {
+  const buffer = readIfExists(abs);
+  if (!buffer) {
     return null;
   }
-  return { buffer: readFileSync(abs), fileName: readSidecarName(`${abs}.name`, "dwg-conversion.png") };
+  return { buffer, fileName: readSidecarName(`${abs}.name`, "dwg-conversion.png") };
 }
 
 /** Read an AI-generated PNG. Returns null when it no longer exists. */
@@ -135,18 +186,32 @@ export async function readAiOutput(id: string): Promise<StoredOutput | null> {
     return { buffer, fileName: storedName || "dwg-ai-generation.png" };
   }
   const abs = aiOutputPath(getConfig().outputsDir, id);
-  if (!existsSync(abs)) {
+  const buffer = readIfExists(abs);
+  if (!buffer) {
     return null;
   }
-  return { buffer: readFileSync(abs), fileName: readSidecarName(`${abs}.name`, "dwg-ai-generation.png") };
+  return { buffer, fileName: readSidecarName(`${abs}.name`, "dwg-ai-generation.png") };
+}
+
+/** Read a file, treating a missing file as `null` instead of throwing. */
+function readIfExists(abs: string): Buffer | null {
+  try {
+    return readFileSync(abs);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
 }
 
 function readSidecarName(path: string, fallback: string): string {
   try {
-    if (existsSync(path)) {
-      const stored = readFileSync(path, "utf8");
-      if (stored) {
-        return stored;
+    const stored = readIfExists(path);
+    if (stored) {
+      const text = stored.toString("utf8");
+      if (text) {
+        return text;
       }
     }
   } catch {
@@ -162,14 +227,8 @@ export async function getAiGenerationCount(id: string): Promise<number> {
     return parseCount(stored);
   }
   const abs = `${aiOutputPath(getConfig().outputsDir, id)}.count`;
-  try {
-    if (!existsSync(abs)) {
-      return 0;
-    }
-    return parseCount(readFileSync(abs, "utf8"));
-  } catch {
-    return 0;
-  }
+  const stored = readIfExists(abs);
+  return parseCount(stored ? stored.toString("utf8") : null);
 }
 
 /** Records one successful AI generation and returns the new total. */
@@ -181,7 +240,10 @@ export async function incrementAiGenerationCount(id: string): Promise<number> {
   }
   const config = getConfig();
   ensureTempDirs(config);
-  writeFileSync(`${aiOutputPath(config.outputsDir, id)}.count`, String(next), "utf8");
+  writeBufferFileAtomic(
+    `${aiOutputPath(config.outputsDir, id)}.count`,
+    Buffer.from(String(next), "utf8")
+  );
   return next;
 }
 
@@ -229,15 +291,19 @@ function parseCacheMeta(stored: string | null): Pick<CachedAiImage, "fileName"> 
  * short-lived output sweep (CLEANUP_AGE_MINUTES) never touches it.
  */
 export async function saveCacheAiImage(hash: string, png: Uint8Array, fileName: string): Promise<void> {
+  const safeName = clampFileName(fileName);
   if (isBlobEnabled()) {
     await putBlob(cacheAiImagePath(hash), Buffer.from(png), "image/png");
-    await putBlob(cacheMetaPath(hash), cacheMetaString(fileName), "application/json");
+    await putBlob(cacheMetaPath(hash), cacheMetaString(safeName), "application/json");
     return;
   }
   const config = getConfig();
   ensureTempDirs(config);
   writeBufferFileAtomic(join(config.cacheDir, `${hash}.ai.png`), png);
-  writeFileSync(join(config.cacheDir, `${hash}.meta`), cacheMetaString(fileName), "utf8");
+  writeBufferFileAtomic(
+    join(config.cacheDir, `${hash}.meta`),
+    Buffer.from(cacheMetaString(safeName), "utf8")
+  );
 }
 
 /** Read a cached AI image. Returns null when there is no cached result yet. */
@@ -252,7 +318,8 @@ export async function readCacheAiImage(hash: string): Promise<CachedAiImage | nu
   }
   const config = getConfig();
   const abs = join(config.cacheDir, `${hash}.ai.png`);
-  if (!existsSync(abs)) {
+  const buffer = readIfExists(abs);
+  if (!buffer) {
     return null;
   }
   let fileName = "dwg-ai-generation.png";
@@ -264,7 +331,7 @@ export async function readCacheAiImage(hash: string): Promise<CachedAiImage | nu
   } catch {
     // Fall back to the generic name.
   }
-  return { buffer: readFileSync(abs), fileName };
+  return { buffer, fileName };
 }
 
 /**
@@ -348,9 +415,13 @@ async function throttledSweep(kind: string, fn: () => Promise<number>): Promise<
   if (now - (lastSweepByKind[kind] ?? 0) < SWEEP_MIN_INTERVAL_MS) {
     return 0;
   }
-  const removed = await fn();
-  lastSweepByKind[kind] = Date.now();
-  return removed;
+  try {
+    return await fn();
+  } finally {
+    // Stamp on success *and* failure so a down store does not re-scan on every
+    // request; a failure just waits for the next window (or the cron).
+    lastSweepByKind[kind] = Date.now();
+  }
 }
 
 /** Throttled variant of sweepExpiredOutputs (≤ once per 10 minutes). */

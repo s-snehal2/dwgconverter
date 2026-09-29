@@ -4,18 +4,11 @@ import { sendRoomToTilesview } from "@/server/services/tilesview";
 import { readAiOutput } from "@/server/services/outputStore";
 import { toAppError, httpStatusForCode, userMessageForCode } from "@/server/utils/errors";
 import { isSafeConversionId } from "@/server/utils/storage";
-import { takeRateLimit } from "@/server/utils/rateLimit";
+import { takeRateLimit, clientIpFrom } from "@/server/utils/rateLimit";
+import type { ErrorCode } from "@/server/utils/errors";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
-
-function clientIp(request: NextRequest): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    return forwarded.split(",")[0]?.trim() ?? "unknown";
-  }
-  return request.headers.get("x-real-ip") ?? "local";
-}
 
 function log(message: string): void {
   console.info(`[tilesview] ${message}`);
@@ -39,11 +32,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     return errorResponse("TILESVIEW_ERROR");
   }
 
-  if (!takeRateLimit(clientIp(request), config.rateLimitMax, 60_000)) {
+  if (!takeRateLimit(clientIpFrom(request.headers), config.rateLimitMax, 60_000)) {
     return errorResponse("RATE_LIMITED");
   }
 
-  const stored = await readAiOutput(id);
+  let stored: Awaited<ReturnType<typeof readAiOutput>> | null;
+  try {
+    stored = await readAiOutput(id);
+  } catch (err) {
+    log(`readAiOutput failed for ${id}: ${err instanceof Error ? err.message : String(err)}.`);
+    return errorResponse("STORAGE_UNAVAILABLE");
+  }
   if (!stored) {
     log(`No AI image found for "${id}".`);
     return errorResponse("FILE_NOT_FOUND");
@@ -72,9 +71,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   }
 }
 
-function errorResponse(code: string) {
+function errorResponse(code: ErrorCode) {
   return Response.json(
-    { success: false, error: userMessageForCode(code as never) },
-    { status: httpStatusForCode(code as never) },
+    { success: false, error: userMessageForCode(code) },
+    { status: httpStatusForCode(code) },
+  );
+}
+
+export async function GET() {
+  return Response.json(
+    { success: false, error: "Use POST /api/tilesview/<id>." },
+    { status: 405, headers: { allow: "POST" } },
   );
 }

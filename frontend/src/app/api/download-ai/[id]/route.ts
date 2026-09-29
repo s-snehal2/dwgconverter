@@ -25,7 +25,13 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     return errorResponse("FILE_NOT_FOUND");
   }
 
-  const stored = await readAiOutput(id);
+  let stored: Awaited<ReturnType<typeof readAiOutput>> | null;
+  try {
+    stored = await readAiOutput(id);
+  } catch (err) {
+    log(`readAiOutput failed for ${id}: ${err instanceof Error ? err.message : String(err)}.`);
+    return errorResponse("DOWNLOAD_ERROR");
+  }
   if (!stored) {
     log(`Download requested for missing AI output "${id}.ai.png".`);
     return errorResponse("FILE_NOT_FOUND");
@@ -59,5 +65,8 @@ function errorResponse(code: ErrorCode) {
 }
 
 export async function POST() {
-  return errorResponse("INVALID_FILE");
+  return Response.json(
+    { success: false, error: "Use GET /api/download-ai/<id>." },
+    { status: 405, headers: { allow: "GET" } }
+  );
 }

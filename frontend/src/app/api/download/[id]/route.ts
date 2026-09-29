@@ -19,7 +19,13 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     return errorResponse("FILE_NOT_FOUND");
   }
 
-  const stored = await readOutput(id);
+  let stored: Awaited<ReturnType<typeof readOutput>> | null;
+  try {
+    stored = await readOutput(id);
+  } catch (err) {
+    log(`readOutput failed for ${id}: ${err instanceof Error ? err.message : String(err)}.`);
+    return errorResponse("DOWNLOAD_ERROR");
+  }
   if (!stored) {
     log(`Download requested for missing output "${id}.png".`);
     return errorResponse("FILE_NOT_FOUND");
@@ -48,5 +54,12 @@ function errorResponse(code: ErrorCode) {
   return Response.json(
     { success: false, error: userMessageForCode(code) },
     { status: httpStatusForCode(code) }
+  );
+}
+
+export async function POST() {
+  return Response.json(
+    { success: false, error: "Use GET /api/download/<id>." },
+    { status: 405, headers: { allow: "GET" } }
   );
 }

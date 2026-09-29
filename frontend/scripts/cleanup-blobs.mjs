@@ -5,20 +5,20 @@
  * Use this to reclaim space immediately (e.g. when the Blob meter shows 100%
  * usage) without waiting for the daily /api/cleanup cron to pick everything up.
  *
- * Safe by default: only blobs under the app's own "outputs/" and "cache/"
- * prefixes and older than the cutoff are deleted. Nothing outside them is ever
- * touched.
+ * Safe by default: only blobs under the app's own "outputs/", "cache/" and
+ * "uploads/" prefixes and older than the cutoff are deleted. Nothing outside
+ * them is ever touched.
  *
  * Usage (from the frontend/ directory):
  *   $env:BLOB_READ_WRITE_TOKEN = "<token from Vercel>"; node scripts/cleanup-blobs.mjs
  *
  * Flags:
  *   --older-than-minutes N   delete blobs older than N minutes (default 43200 = 30 days)
- *   --all                    delete every blob under the outputs/ + cache/ prefixes
+ *   --all                    delete every blob under the outputs/ + cache/ + uploads/ prefixes
  */
 import { list, del } from "@vercel/blob";
 
-const PREFIXES = ["outputs/", "cache/"];
+const PREFIXES = ["outputs/", "cache/", "uploads/"];
 
 function parseArgs(argv) {
   const args = { olderThanMinutes: 43200, all: false };
@@ -52,7 +52,7 @@ if (!process.env.BLOB_READ_WRITE_TOKEN) {
 const args = parseArgs(process.argv.slice(2));
 const cutoffMs = args.all ? 0 : Date.now() - args.olderThanMinutes * 60 * 1000;
 const label = args.all
-  ? "everything under outputs/ and cache/"
+  ? "everything under outputs/, cache/ and uploads/"
   : `blobs older than ${args.olderThanMinutes} minute(s)`;
 
 const expired = [];

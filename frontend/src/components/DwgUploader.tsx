@@ -19,8 +19,15 @@ export default function DwgUploader({ file, onFile, onClear, disabled = false, m
 
   const handleFiles = useCallback(
     (list: FileList | null) => {
-      const candidate = list?.[0];
-      if (candidate) onFile(candidate);
+      if (!list || list.length === 0) {
+        return;
+      }
+      const candidates = Array.from(list);
+      // A drop can contain several files; prefer the first .dwg in the list.
+      const candidate = candidates.find((f) => /\.dwg$/i.test(f.name)) ?? candidates[0];
+      if (candidate) {
+        onFile(candidate);
+      }
     },
     [onFile]
   );

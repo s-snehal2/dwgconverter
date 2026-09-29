@@ -26,10 +26,6 @@ export function aiOutputPath(dir: string, id: string): string {
   return join(dir, `${id}.ai.png`);
 }
 
-export function writeBufferFile(absolutePath: string, buffer: Uint8Array): void {
-  writeFileSync(absolutePath, buffer);
-}
-
 /**
  * Write a file atomically: the content is first written to a unique sibling
  * file and then renamed over the destination, so a reader can never observe a

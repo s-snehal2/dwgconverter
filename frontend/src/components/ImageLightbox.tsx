@@ -51,22 +51,63 @@ export default function ImageLightbox({
     originY: number;
   } | null>(null);
 
+  // Measured at interaction time (no ResizeObserver needed): the viewer box and
+  // the transformed image box are read straight from the DOM.
+  const viewerRef = useRef<HTMLDivElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
   const resetView = useCallback(() => {
     setScale(1);
     setOffset({ x: 0, y: 0 });
   }, []);
 
   // A new image should start fit-to-window rather than inherit the zoom the user
-  // left on the previous one. Keying on `src` during render is the idiomatic way
-  // to reset state on a prop change without a setState inside an effect.
+  // left on the previous one. Adjusting state during render (guarded so it
+  // converges) is the canonical way to reset derived state when a prop changes.
   const [shownSrc, setShownSrc] = useState(src);
   if (src !== shownSrc) {
     setShownSrc(src);
     resetView();
   }
 
-  const zoomIn = useCallback(() => setScale((s) => nextScale(s, 1)), []);
-  const zoomOut = useCallback(() => setScale((s) => nextScale(s, -1)), []);
+  /**
+   * Keep a zoomed image from being panned entirely off-screen. The image is
+   * centred on a much larger transform origin than the visual box, so the
+   * maximum sensible drag distance in each axis is half the overflow.
+   */
+  const clampOffset = useCallback(
+    (next: { x: number; y: number }, nextScale: number) => {
+      if (nextScale <= 1 + 1e-6) {
+        return { x: 0, y: 0 };
+      }
+      const viewer = viewerRef.current;
+      const img = imgRef.current;
+      if (!viewer || !img) {
+        return next;
+      }
+      const viewBox = viewer.getBoundingClientRect();
+      const imageBox = img.getBoundingClientRect();
+      const maxX = Math.max(0, (imageBox.width - viewBox.width) / 2);
+      const maxY = Math.max(0, (imageBox.height - viewBox.height) / 2);
+      return {
+        x: Math.min(maxX, Math.max(-maxX, next.x)),
+        y: Math.min(maxY, Math.max(-maxY, next.y)),
+      };
+    },
+    []
+  );
+
+  const zoomIn = useCallback(() => {
+    const next = nextScale(scale, 1);
+    setScale(next);
+    setOffset((o) => clampOffset(o, next));
+  }, [scale, clampOffset]);
+
+  const zoomOut = useCallback(() => {
+    const next = nextScale(scale, -1);
+    setScale(next);
+    setOffset((o) => clampOffset(o, next));
+  }, [scale, clampOffset]);
 
   useEffect(() => {
     if (!open) {
@@ -90,12 +131,40 @@ export default function ImageLightbox({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, zoomIn, zoomOut, resetView]);
 
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    // Only zoom, never scroll the page, while the pointer is over the image.
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1 + WHEEL_STEP : 1 / (1 + WHEEL_STEP);
-    setScale((s) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s * factor)));
-  }, []);
+  const handleWheel = useCallback(
+    (e: React.WheelEvent<HTMLDivElement>) => {
+      // Only zoom, never scroll the page, while the pointer is over the image.
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1 + WHEEL_STEP : 1 / (1 + WHEEL_STEP);
+      const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
+      if (next === scale) {
+        return;
+      }
+      const viewer = viewerRef.current;
+      const img = imgRef.current;
+      setScale(next);
+      setOffset((prev) => {
+        if (!viewer || !img) {
+          return clampOffset(prev, next);
+        }
+        // Zoom towards the cursor: keep the image pixel under the pointer fixed
+        // on screen rather than zooming around the image centre.
+        const viewRect = viewer.getBoundingClientRect();
+        const imgRect = img.getBoundingClientRect();
+        const pointerX = e.clientX - viewRect.left;
+        const pointerY = e.clientY - viewRect.top;
+        const ratio = next / scale;
+        const imageX = pointerX - (imgRect.left - viewRect.left) - imgRect.width / 2 - prev.x;
+        const imageY = pointerY - (imgRect.top - viewRect.top) - imgRect.height / 2 - prev.y;
+        const nextOffset = {
+          x: prev.x + (imageX - imageX * ratio),
+          y: prev.y + (imageY - imageY * ratio),
+        };
+        return clampOffset(nextOffset, next);
+      });
+    },
+    [scale, clampOffset]
+  );
 
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
@@ -115,16 +184,24 @@ export default function ImageLightbox({
     [offset.x, offset.y]
   );
 
-  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current;
-    if (!drag || drag.pointerId !== e.pointerId) {
-      return;
-    }
-    setOffset({
-      x: drag.originX + (e.clientX - drag.startX),
-      y: drag.originY + (e.clientY - drag.startY),
-    });
-  }, []);
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = dragRef.current;
+      if (!drag || drag.pointerId !== e.pointerId) {
+        return;
+      }
+      setOffset(
+        clampOffset(
+          {
+            x: drag.originX + (e.clientX - drag.startX),
+            y: drag.originY + (e.clientY - drag.startY),
+          },
+          scale
+        )
+      );
+    },
+    [scale, clampOffset]
+  );
 
   const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (dragRef.current?.pointerId === e.pointerId) {
@@ -140,7 +217,8 @@ export default function ImageLightbox({
       return;
     }
     setScale(2);
-  }, [scale, resetView]);
+    setOffset((o) => clampOffset(o, 2));
+  }, [scale, resetView, clampOffset]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -198,6 +276,7 @@ export default function ImageLightbox({
         </div>
 
         <div
+          ref={viewerRef}
           onWheel={handleWheel}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -212,6 +291,7 @@ export default function ImageLightbox({
           {src ? (
             /* eslint-disable-next-line @next/next/no-img-element */
             <img
+              ref={imgRef}
               src={src}
               alt={alt}
               draggable={false}

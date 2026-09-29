@@ -40,12 +40,16 @@ interface DirectUploadCapability {
   maxBytes: number;
 }
 
-let cachedCapability: DirectUploadCapability | null | undefined;
+let cachedCapability: DirectUploadCapability | undefined;
 
 /**
- * Ask the server once whether direct-to-Blob uploads are available.
+ * Ask the server whether direct-to-Blob uploads are available.
  * Anything unexpected (offline, 404 in local dev) resolves to `null` so the
  * caller falls back to a normal multipart POST.
+ *
+ * Only a *positive* answer is cached. A negative one is not, so the next
+ * attempt re-checks — e.g. once a suspended Blob store comes back, direct
+ * uploads resume without a page reload.
  */
 async function getDirectUploadCapability(): Promise<DirectUploadCapability | null> {
   if (cachedCapability !== undefined) {
@@ -54,21 +58,20 @@ async function getDirectUploadCapability(): Promise<DirectUploadCapability | nul
   try {
     const res = await fetch(UPLOAD_ROUTE, { method: "GET" });
     if (!res.ok) {
-      cachedCapability = null;
       return null;
     }
     const data = (await res.json()) as Partial<DirectUploadCapability>;
-    cachedCapability =
-      data?.directUpload === true
-        ? {
-            directUpload: true,
-            access: data.access === "public" ? "public" : "private",
-            prefix: typeof data.prefix === "string" ? data.prefix : "uploads/",
-            maxBytes: typeof data.maxBytes === "number" ? data.maxBytes : Number.MAX_SAFE_INTEGER,
-          }
-        : null;
+    if (data?.directUpload !== true) {
+      return null;
+    }
+    cachedCapability = {
+      directUpload: true,
+      access: data.access === "public" ? "public" : "private",
+      prefix: typeof data.prefix === "string" ? data.prefix : "uploads/",
+      maxBytes: typeof data.maxBytes === "number" ? data.maxBytes : Number.MAX_SAFE_INTEGER,
+    };
   } catch {
-    cachedCapability = null;
+    return null;
   }
   return cachedCapability;
 }

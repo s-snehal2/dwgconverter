@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import ConverterCard from "@/components/ConverterCard";
 import type {
@@ -25,6 +25,16 @@ export default function Home() {
   const [omittedBlankSheets, setOmittedBlankSheets] = useState<OmittedSheet[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Async continuations (conversion promise resolution) must not touch React
+  // state after the component has unmounted.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const cancelInFlight = useCallback(() => {
     abortRef.current?.abort();
@@ -99,6 +109,9 @@ export default function Home() {
           }
         },
       });
+      if (!mountedRef.current) {
+        return;
+      }
       setStep("render");
       setResults(converted.sheets);
       setOmittedBlankSheets(converted.omittedBlankSheets ?? []);
@@ -109,6 +122,9 @@ export default function Home() {
           : "Conversion complete. Your PNG is ready."
       );
     } catch (err) {
+      if (!mountedRef.current) {
+        return;
+      }
       if (isAbortError(err)) {
         resetFromCancel();
         return;
@@ -119,10 +135,12 @@ export default function Home() {
       setUploadProgress(null);
       toast.error(message);
     } finally {
-      setConverting(false);
-      setUploadProgress(null);
       if (abortRef.current === controller) {
         abortRef.current = null;
+      }
+      if (mountedRef.current) {
+        setConverting(false);
+        setUploadProgress(null);
       }
     }
   }, [file, resetFromCancel]);

@@ -72,7 +72,9 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(objectUrl);
+      // Revoke after the browser has had a chance to start the download;
+      // revoking synchronously can abort it in some browsers.
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
     },
     []
   );
@@ -131,8 +133,13 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
       toast.success(`Sent to TilesView. Room ID: ${res.customRoomsId}. Opened in a new tab.`);
       if (opener && !opener.closed) {
         opener.location.href = res.visualizerUrl;
+      } else if (window.open(res.visualizerUrl, "_blank", "noopener,noreferrer")) {
+        // Continuation of the pre-opened tab, or a fresh one.
       } else {
-        window.open(res.visualizerUrl, "_blank", "noopener,noreferrer");
+        toast.error(
+          `Sent to TilesView (room ${res.customRoomsId}), but your browser blocked the new tab: ${res.visualizerUrl}`,
+          { duration: 12_000 }
+        );
       }
     } catch (err) {
       opener?.close();

@@ -40,6 +40,9 @@ export async function sendRoomToTilesview(
         app_secret: config.tilesviewAppSecret,
       },
       body: form,
+      // Never hang the serverless function: the route has `maxDuration = 60`,
+      // so a stuck upstream must be cut off well short of that.
+      signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === "TimeoutError") {

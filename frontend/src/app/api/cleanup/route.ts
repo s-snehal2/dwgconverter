@@ -40,10 +40,18 @@ export async function GET(request: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Cleanup failed: ${message}`);
-    return Response.json({ success: false, error: message }, { status: 500 });
+    // Never echo the underlying error (file paths, store names) back to a
+    // caller, even an authenticated cron one.
+    return Response.json(
+      { success: false, error: "Cleanup failed." },
+      { status: 500, headers: { "retry-after": "3600" } },
+    );
   }
 }
 
 export async function POST() {
-  return Response.json({ success: false, error: "Use GET /api/cleanup." }, { status: 405 });
+  return Response.json(
+    { success: false, error: "Use GET /api/cleanup." },
+    { status: 405, headers: { allow: "GET" } },
+  );
 }

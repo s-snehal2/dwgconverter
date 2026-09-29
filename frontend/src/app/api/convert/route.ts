@@ -151,6 +151,10 @@ async function readUploadedDwg(request: NextRequest, config: AppConfig): Promise
 export async function POST(request: NextRequest) {
   const config = getConfig();
 
+  if (!takeRateLimit(clientIp(request), config.rateLimitMax, 60_000)) {
+    return errorResponse("RATE_LIMITED");
+  }
+
   try {
     const removed = await sweepExpiredOutputsThrottled(config.cleanupAgeMs);
     if (removed > 0) {
@@ -158,10 +162,6 @@ export async function POST(request: NextRequest) {
     }
   } catch (err) {
     log(`Cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  if (!takeRateLimit(clientIp(request), config.rateLimitMax, 60_000)) {
-    return errorResponse("RATE_LIMITED");
   }
 
   ensureTempDirs(config);
@@ -263,7 +263,6 @@ export async function POST(request: NextRequest) {
   } finally {
     if (uploadAbs) {
       deleteFileIfExists(uploadAbs);
-      deleteFileIfExists(`${uploadAbs}.name`);
     }
     if (uploadUrl) {
       await deleteUploadBlob(uploadUrl);

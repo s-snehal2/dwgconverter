@@ -9,32 +9,45 @@ import { isBlobEnabled, UPLOAD_BLOB_PREFIX } from "@/server/services/outputStore
  * drawing. The convert route then receives only a URL, reads the bytes back,
  * and deletes the upload when it is done with them.
  *
- * The prefix check is the only thing standing between "convert this file" and
- * "read this arbitrary URL", so it is deliberately narrow: https only, and
- * only paths under our own `uploads/` prefix.
+ * The URL check is the only thing standing between "convert this file" and
+ * "read this arbitrary URL", so it is deliberately narrow: https only, paths
+ * under our own `uploads/` prefix, and it only ever produces a bare pathname.
+ * The SDK is then handed the pathname instead of the caller-supplied host,
+ * so the read-write `BLOB_READ_WRITE_TOKEN` can never be sent to a store URL
+ * the caller chose.
  */
 
-/**
- * True when `url` is an https Blob URL inside our own `uploads/` prefix.
- *
- * This is a prefix check, not a host check. `@vercel/blob`'s `get` refuses any
- * host that is not the account's own Blob store, so a caller that passes a
- * look-alike host still cannot exfiltrate anything; this only rejects URLs we
- * never issued in the first place.
- */
-export function isTrustedUploadUrl(url: string): boolean {
+const UPLOAD_KEY_RE = /^uploads\/[A-Za-z0-9._-]{1,255}$/;
+
+/** Reduce a caller-supplied URL to a trusted `uploads/…` pathname, or null. */
+function trustedUploadPathname(url: string): string | null {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    return false;
+    return null;
   }
 
   if (parsed.protocol !== "https:") {
-    return false;
+    return null;
   }
 
-  return parsed.pathname.startsWith(`/${UPLOAD_BLOB_PREFIX}`);
+  const pathname = parsed.pathname.replace(/^\/+/, "");
+  if (!UPLOAD_KEY_RE.test(pathname)) {
+    return null;
+  }
+
+  // Must actually be under our own prefix (the regex above already anchors it).
+  if (!pathname.startsWith(UPLOAD_BLOB_PREFIX)) {
+    return null;
+  }
+
+  return pathname;
+}
+
+/** True when `url` is an https Blob URL inside our own `uploads/` prefix. */
+export function isTrustedUploadUrl(url: string): boolean {
+  return trustedUploadPathname(url) !== null;
 }
 
 /** Read an uploaded DWG back out of Blob. Throws if it is missing or unreadable. */
@@ -43,12 +56,34 @@ export async function readUploadBlob(url: string): Promise<Buffer> {
     throw new Error("Blob storage is not enabled.");
   }
 
-  const result = await get(url, { access: "private", useCache: false });
-  if (!result || result.statusCode !== 200) {
+  const pathname = trustedUploadPathname(url);
+  if (!pathname) {
+    throw new Error("Upload path is not trusted.");
+  }
+
+  const result = await get(pathname, { access: "private", useCache: false });
+  if (!result || result.statusCode !== 200 || !result.stream) {
     throw new Error("Upload not found.");
   }
 
-  return Buffer.from(await new Response(result.stream).arrayBuffer());
+  const reader = result.stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
 }
 
 /**
@@ -62,8 +97,13 @@ export async function deleteUploadBlob(url: string): Promise<void> {
     return;
   }
 
+  const pathname = trustedUploadPathname(url);
+  if (!pathname) {
+    return;
+  }
+
   try {
-    await del(url);
+    await del(pathname);
   } catch {
     // Left for the sweep.
   }

@@ -10,7 +10,7 @@ import {
   getAiGenerationCount,
   incrementAiGenerationCount,
 } from "@/server/services/outputStore";
-import { toAppError, AppError, httpStatusForCode, userMessageForCode } from "@/server/utils/errors";
+import { toAppError, AppError, userMessageForCode, httpStatusForCode, type ErrorCode } from "@/server/utils/errors";
 import { isSafeConversionId } from "@/server/utils/storage";
 import { sha256Hex } from "@/server/utils/hash";
 import { takeRateLimit } from "@/server/utils/rateLimit";
@@ -40,7 +40,7 @@ async function readUserPrompt(request: NextRequest, maxChars: number): Promise<s
       return undefined;
     }
     if (trimmed.length > maxChars) {
-      throw new AppError("INVALID_FILE", `The AI prompt is too long (max ${maxChars} characters).`);
+      throw new AppError("INVALID_PROMPT", "The AI prompt is too long.");
     }
     return trimmed;
   }
@@ -79,21 +79,29 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     );
   }
 
-  // Best-effort periodic cleanup of expired outputs.
-  try {
-    await sweepExpiredOutputsThrottled(config.cleanupAgeMs);
-  } catch (err) {
-    log(`Cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
   if (!takeRateLimit(clientIp(request), config.rateLimitMax, 60_000)) {
     return errorResponse("RATE_LIMITED");
   }
 
-  const stored = await readOutput(id);
+  let stored: Awaited<ReturnType<typeof readOutput>> | null;
+  try {
+    stored = await readOutput(id);
+  } catch (err) {
+    const appError = toAppError(err);
+    log(`readOutput failed for ${id}: ${err instanceof Error ? err.message : String(err)}.`);
+    return errorResponse(appError.code === "STORAGE_UNAVAILABLE" ? "STORAGE_UNAVAILABLE" : "DOWNLOAD_ERROR");
+  }
   if (!stored) {
     log(`Generate requested for missing output "${id}.png".`);
     return errorResponse("FILE_NOT_FOUND");
+  }
+
+  // Best-effort periodic cleanup of expired outputs, *after* the output this
+  // handler depends on has been read (sweeping first could delete it mid-flight).
+  try {
+    await sweepExpiredOutputsThrottled(config.cleanupAgeMs);
+  } catch (err) {
+    log(`Cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   const usedSoFar = await getAiGenerationCount(id);
@@ -106,30 +114,35 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   const png = stored.buffer;
 
   const hash = sha256Hex(png);
+  let cached: Awaited<ReturnType<typeof readCacheAiImage>> = null;
   try {
-    const cached = await readCacheAiImage(hash);
-    if (cached) {
-      const fileName = cached.fileName || `${baseName}-ai.png`;
-      await saveAiOutput(id, cached.buffer, fileName);
-      log(
-        `Cache hit for ${hash}: reusing earlier AI image (${cached.buffer.byteLength} bytes) without calling Gemini.`
-      );
-      return Response.json(
-        {
-          success: true,
-          conversionId: id,
-          fileName,
-          size: cached.buffer.byteLength,
-          durationMs: 0,
-          generationsUsed: usedSoFar,
-          generationsLimit: config.aiGenerationLimit,
-          cached: true,
-        },
-        { status: 200 },
-      );
-    }
+    cached = await readCacheAiImage(hash);
   } catch (err) {
+    // A failed cache *lookup* should never block generation.
     log(`Cache lookup failed, generating fresh: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (cached) {
+    const fileName = cached.fileName || `${baseName}-ai.png`;
+    // Failure to persist the cached copy surfaces as an error rather than
+    // silently paying for a second Gemini call.
+    await saveAiOutput(id, cached.buffer, fileName);
+    log(
+      `Cache hit for ${hash}: reusing earlier AI image (${cached.buffer.byteLength} bytes) without calling Gemini.`
+    );
+    return Response.json(
+      {
+        success: true,
+        conversionId: id,
+        fileName,
+        size: cached.buffer.byteLength,
+        durationMs: 0,
+        generationsUsed: usedSoFar,
+        generationsLimit: config.aiGenerationLimit,
+        cached: true,
+      },
+      { status: 200 },
+    );
   }
 
   try {
@@ -189,13 +202,16 @@ function limitResponse(limit: number) {
   );
 }
 
-function errorResponse(code: string) {
+function errorResponse(code: ErrorCode) {
   return Response.json(
-    { success: false, error: userMessageForCode(code as never) },
-    { status: httpStatusForCode(code as never) },
+    { success: false, error: userMessageForCode(code) },
+    { status: httpStatusForCode(code) },
   );
 }
 
 export async function GET() {
-  return errorResponse("INVALID_FILE");
+  return Response.json(
+    { success: false, error: "Use POST /api/generate/<id> to generate an AI image." },
+    { status: 405, headers: { allow: "POST" } },
+  );
 }

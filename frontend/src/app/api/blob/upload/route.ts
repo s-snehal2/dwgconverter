@@ -6,6 +6,12 @@ import { takeRateLimit, clientIpFrom } from "@/server/utils/rateLimit";
 
 export const runtime = "nodejs";
 
+// Whether Blob is enabled depends on runtime env vars (BLOB_READ_WRITE_TOKEN /
+// VERCEL_OIDC_TOKEN). Without this, Next can statically bake the response at
+// build time — local builds (no token) would permanently advertise
+// `directUpload: false` even on machines that do have it.
+export const dynamic = "force-dynamic";
+
 /** Upload tokens are short-lived; a leaked one is only useful for a few minutes. */
 const TOKEN_TTL_MS = 15 * 60 * 1000;
 
@@ -47,7 +53,7 @@ export async function POST(request: NextRequest) {
   if (!takeRateLimit(clientIpFrom(request.headers), config.rateLimitMax, 60_000)) {
     return Response.json(
       { success: false, error: "Too many requests. Please try again shortly." },
-      { status: 429 }
+      { status: 429, headers: { "retry-after": "60" } }
     );
   }
 
