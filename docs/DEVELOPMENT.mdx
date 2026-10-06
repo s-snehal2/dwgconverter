@@ -7,7 +7,7 @@ description: Architecture, data models, API reference, configuration, error taxo
 
 This document is the developer reference for the whole application. It
 describes the architecture, the internal data model, every API endpoint, the
-configuration surface, the error taxonomy, and how to develop and test the
+configuration surface, the error taxonomy, and how to develop and verify the
 code.
 
 The end-user documentation lives in [`../README.md`](../README.md); this file
@@ -27,6 +27,7 @@ focuses on how the pieces fit together so you can extend or debug the app.
 - [API reference](#api-reference)
 - [Errors & rate limiting](#errors--rate-limiting)
 - [Storage & file lifecycle](#storage--file-lifecycle)
+- [Verifying conversion fidelity](#verifying-conversion-fidelity)
 - [Development guide](#development-guide)
 - [Known limitations](#known-limitations)
 
@@ -42,8 +43,8 @@ A self-hosted web app that converts a DWG drawing into PNG images:
    white-background PNG — **one PNG per sheet**.
 3. The user previews the sheets, selects one, and can download it.
 4. Optionally, the server sends the **selected** sheet's PNG to Google Gemini to
-   produce a photorealistic architectural visualization. The user can describe
-   the image they want and it is appended to the built-in prompt.
+   produce a photorealistic architectural visualization. That PNG and the
+   configured prompt are the only two inputs.
 
 Design principles:
 
@@ -75,7 +76,7 @@ Design principles:
 | UI | React **19.2.8**, Tailwind CSS **v4**, `radix-ui`, `shadcn`, `cn`, `class-variance-authority`, `lucide-react`, `sonner` (toasts), `next-themes`, `tw-animate-css` |
 | DWG parsing | `@node-projects/acad-ts` (pure TypeScript, MIT) |
 | PNG rasterization | `sharp` (libvips-based) |
-| Testing | `vitest` (unit + integration), `eslint` |
+| Static analysis | `typescript` (`tsc --noEmit`), `eslint` |
 
 All code lives under `frontend/` — there is no separate API service. Conversion
 runs inside the Next.js route handler with the Node.js runtime.
@@ -114,7 +115,7 @@ Browser ─► POST /api/convert ─► validate (extension, size, signature, ra
                         ▼                                ▼
               write {id}.png per sheet        client preview:
               + {id}.png.name sidecar         GET /api/download/[id]
-                                                optional AI:     POST /api/generate/[id] { prompt }
+                                                optional AI:     POST /api/generate/[id]
                                                                   → GET /api/download-ai/[id]
 ```
 
@@ -130,16 +131,22 @@ dwg2png/
 │   │   │   ├── layout.tsx
 │   │   │   └── api/
 │   │   │       ├── convert/route.ts            # POST multipart DWG → PNG
+│   │   │       ├── upload/route.ts              # GET/POST 404 tombstone
 │   │   │       ├── generate/[id]/route.ts      # POST AI image (Gemini)
+│   │   │       ├── tilesview/[id]/route.ts     # POST publish to TilesView
 │   │   │       ├── download/[id]/route.ts      # GET PNG bytes
-│   │   │       └── download-ai/[id]/route.ts   # GET AI PNG bytes
+│   │   │       ├── download-ai/[id]/route.ts   # GET AI PNG bytes
+│   │   │       └── cleanup/route.ts            # GET/POST cron bucket purge
 │   │   ├── components/
 │   │   │   ├── ConverterCard.tsx               # upload / convert / cancel / reset UI
 │   │   │   ├── ConversionProgress.tsx          # step indicator (upload→parse→render)
 │   │   │   ├── ConversionResult.tsx            # sheet gallery: select + download + AI
+│   │   │   ├── DwgUploader.tsx
 │   │   │   ├── ErrorMessage.tsx
+│   │   │   ├── Header.tsx
 │   │   │   ├── ImageLightbox.tsx
-│   │   │   └── ImagePreviewCard.tsx
+│   │   │   ├── ImagePreviewCard.tsx
+│   │   │   └── ThemeToggle.tsx
 │   │   ├── services/api.ts                     # client fetch wrappers
 │   │   ├── types/conversion.ts                 # shared result/error types
 │   │   └── server/
@@ -151,23 +158,30 @@ dwg2png/
 │   │       │   ├── dwgParser.ts                # normalize model, explode blocks
 │   │       │   ├── entityExtractor.ts          # acad-ts entity → normalized entity
 │   │       │   ├── boundsCalculator.ts         # union bounds of entities
+│   │       │   ├── textMetrics.ts              # shared text extents (bounds + culling)
+│   │       │   ├── drawingNotes.ts             # sheet text (expected set for the text audit)
 │   │       │   ├── coordinateMapper.ts         # world → pixel viewport
 │   │       │   ├── viewportMapper.ts           # project model entities into a page viewport
+│   │       │   ├── modelClusterer.ts           # split modelspace into separate drawings
+│   │       │   ├── blankSheet.ts                # pre/post render blank-sheet detection
 │   │       │   ├── renderer.ts                 # normalized Drawing → SVG
 │   │       │   ├── pngGenerator.ts             # sharp SVG → PNG
 │   │       │   ├── convertDwg.ts               # orchestrator (inspect/select/render)
 │   │       │   ├── geminiImage.ts              # Gemini image generation
-│   │       │   └── fileCleanup.ts              # age-based temp sweep
+│   │       │   ├── tilesview.ts                # TilesView room publish
+│   │       │   ├── supabaseStore.ts            # Supabase Storage adapter
+│   │       │   ├── outputStore.ts              # outputs/ (bucket or disk)
+│   │       │   ├── uploadStore.ts              # staged uploads/{uuid}.dwg
+│   │       │   └── fileCleanup.ts              # age-based disk/bucket sweep
 │   │       └── utils/
 │   │           ├── errors.ts                   # ErrorCode taxonomy + HTTP mapping
 │   │           ├── fileValidation.ts           # extension / size / DWG signature
-│   │           ├── rateLimit.ts                # per-IP sliding window
+│   │           ├── rateLimit.ts                # per-IP fixed window
 │   │           ├── storage.ts                  # paths, atomic writes, safe IDs
+│   │           ├── hash.ts                     # SHA-256 (AI cache key)
 │   │           ├── geometry.ts                 # arc/bulge helpers
 │   │           └── lineWeight.ts               # raw DWG weight → pixels
-│   ├── temp/       # runtime uploads/ + outputs/ (git-ignored)
-│   ├── scripts/with-heap.mjs   # dev/build/start wrapper (Node heap tuning)
-│   ├── vitest.config.mts
+│   ├── temp/       # runtime outputs/ (git-ignored; unused with Supabase)
 │   ├── eslint.config.mjs
 │   ├── next.config.ts
 │   └── package.json
@@ -180,23 +194,33 @@ dwg2png/
 
 ## Conversion pipeline
 
-The pipeline is deliberately modular — every stage is a small, unit-testable
-function. Entry points: `frontend/src/server/services/convertDwg.ts`.
+The pipeline is deliberately modular — every stage is a small function with a
+narrow contract. Entry points: `frontend/src/server/services/convertDwg.ts`.
 
 ### 1. Request handling — `app/api/convert/route.ts`
 
 On every `POST /api/convert`:
 
-1. **Temp sweep** — `sweepTempDirs` removes files older than
-   `CLEANUP_AGE_MINUTES` (best effort; failures are logged, not fatal).
-2. **Rate limit** — `takeRateLimit(clientIp(request), …)` rejects with
+1. **Rate limit** — `takeRateLimit(clientIp(request), …)` rejects with
    `RATE_LIMITED` when the per-IP budget is exceeded.
-3. **Multipart parse** — reads a single `file` field (`File`).
-4. **Validation** — extension must be `.dwg` (`validateExtension`) and size
+2. **Intake** — `content-type: application/json` selects the direct-upload path
+   (`uploadPath` is checked with `isTrustedUploadPath`, then read back and
+   measured); anything else is parsed as multipart with a single `file` field,
+   converted straight out of the request buffer.
+3. **Validation** — extension must be `.dwg` (`validateExtension`) and size
    within `MAX_FILE_SIZE_MB` (`validateFileSize`).
-5. **Convert** — calls `convertDwg(buffer, config)`, writes the PNG and a
+4. **Expired-object sweep** — `sweepExpiredOutputsThrottled` reclaims stale
+   `outputs/` and `uploads/` objects (best effort; failures are logged, not
+   fatal). This runs *after* intake on purpose: a directly-uploaded DWG is still
+   sitting in `uploads/` waiting to be read, and the sweep covers that prefix,
+   so sweeping first could delete the file this request is about to convert.
+5. **Convert** — calls `convertDwg(buffer, config)`, stores the PNG and a
    `.name` sidecar, returns the JSON result with statistics.
-6. **Cleanup** — the temp upload is always deleted in a `finally` block.
+6. **Cleanup** — a staged `uploadPath` is always deleted in a `finally` block.
+
+Sheet names and file names come out of the DWG and may contain control
+characters; every value that reaches a log line is escaped by `logSafe` so a
+crafted sheet name cannot forge log lines or drive terminal escapes.
 
 `export const maxDuration = 300` (up to 5 minutes) and `runtime = "nodejs"`.
 
@@ -245,8 +269,10 @@ if (sheets.length === 0) throw new AppError("NO_DRAWABLE_CONTENT", "…");
   (≥ 15,000 normalized entities) the supersample is disabled
   (`supersampleForEntities`) — a 6000px canvas with tens of thousands of
   entities would otherwise be disproportionately slow.
-- **Blank sheets are dropped, in two stages** — the rule is *no drawing, no PNG*,
-  and each stage catches a failure the other cannot.
+- **Blank sheets are dropped only when `DROP_BLANK_SHEETS=true`** (off by
+  default, so every sheet becomes a PNG and no drawing content can be
+  silently lost). When enabled, two stages apply — the rule is *no drawing, no
+  PNG*, and each stage catches a failure the other cannot.
 
   1. **Does the sheet show a drawing?** (`blankSheet.hasSheetDrawing`, run
      *before* rendering, so a rejected sheet costs no pixels). A paper-space
@@ -262,10 +288,10 @@ if (sheets.length === 0) throw new AppError("NO_DRAWABLE_CONTENT", "…");
      This stage exists because a layout whose viewport frames empty model space
      still renders a *page* full of border, title block and hatch ink, which is
      exactly what a blank sheet looks like. Ink cannot tell the two apart; the
-     viewport geometry can. The test projects all four bounds corners and
-     over-approximates, erring toward keeping a sheet — a false keep leaves a
-     blank page, a false drop would lose a real drawing. A prefilter on the
-     unrotated model-space bounds keeps the cost negligible.
+viewport geometry can. The check projects all four bounds corners and
+      over-approximates, erring toward keeping a sheet — a false keep leaves a
+      blank page, a false drop would lose a real drawing. A prefilter on the
+      unrotated model-space bounds keeps the cost negligible.
 
   2. **Does the render clear the ink threshold?** `rasterInkFraction` measures
      ink coverage on the rendered PNG. A sheet under `blankSheetInkFraction`
@@ -273,7 +299,7 @@ if (sheets.length === 0) throw new AppError("NO_DRAWABLE_CONTENT", "…");
      dropped, catching a sheet that does hold geometry yet still renders nearly
      empty.
 
-  A sheet must pass both. Dropped sheets are recorded in `omittedBlankSheets`
+  A sheet must pass both (when dropping is enabled). Dropped sheets are recorded in `omittedBlankSheets`
   with a `reason` (`no-drawing` or `too-little-detail`) and **not** returned in
   `sheets`, so they are never rasterized to storage, never downloaded, and never
   offered to the AI step. The UI shows an "N sheets produced no PNGs" note
@@ -299,7 +325,7 @@ interface DwgReaderPort { read(arrayBuffer: ArrayBuffer): RawDwgData }
 ```
 
 `AcadDwgReader` wraps `DwgReader.readFromStream` from `@node-projects/acad-ts`.
-The engine is created via `createDwgReader()`; tests inject a fake port through
+The engine is created via `createDwgReader()` and is injectable through
 `overrides`. Swapping engines later means implementing `DwgReaderPort` only.
 
 ### 4. Normalization — `dwgParser.ts` + `entityExtractor.ts`
@@ -309,9 +335,18 @@ Highlights:
 
 - **Entity extraction** (`entityExtractor.ts`) maps acad-ts classes
   (`Line`, `Circle`, `Arc`, `Point`, `Ellipse`, `LwPolyline`, `Polyline*`,
-  `TextEntity`, `MText`, `Spline`, `Solid`, `Face3D`) into typed normalized
-  entities. Colors resolve to CSS hex; near-white colors become black; layers
-  and visibility are resolved eagerly.
+  `TextEntity` (including valued block `ATTRIB` instances), `MText`,
+  `Spline`, `Solid`, `Face3D`, `MLine`, `XLine`/`Ray` (stretched to the sheet
+  diagonal by `resolveInfiniteLines`), `Tolerance`, `Mesh`/`PolygonMesh`/
+  `PolyfaceMesh` faces, ACIS `ModelerGeometry` wire outlines (`Region`,
+  `Solid3D`, `CadBody`, AEC `Wall` as a plan rectangle), `TableEntity` grids
+  with cell text, `MultiLeader` lines with labels, underlay/OLE placement
+  frames, plus `Hatch`/`Dimension`/`Leader` below) into the existing normalized
+  types (`LINE`, `POLYLINE`, `TEXT`, `SOLID`, `IMAGE`, `POINT`), so the
+  renderer, bounds and viewport projection need no per-class cases. Colors
+  resolve to CSS hex; near-white colors become black; layers and visibility
+  are resolved eagerly. Legacy `SHAPE` glyphs keep only their insertion point
+  (acad-ts exposes no reconstructible outline).
 - **Splines** are tessellated into dense polylines via
   `spline.tryPolygonalVertexes(...)` (segment count scales with control-point
   count, clamped to 24…512).
@@ -362,17 +397,35 @@ no acad-ts imports). It emits a plain SVG in **final pixel coordinates**
   the major-axis endpoint and `radiusRatio`.
 - **Line weights** — `mapLineWeightToPixels` (Raw DWG 1/100 mm → px), floored
   at `MIN_STROKE_PX` so hairlines don't vanish.
-- **Text** — rendered as `<text>` with font-size from CAD height, rotation,
-  and XML escaping. Alignment is currently fixed to left/baseline (see
-  [Known limitations](#known-limitations)).
-- **Colors** — `COLOR_MODE=color` uses the resolved entity colors; the default
-  outputs pure black strokes on white.
+- **Text** — rendered as `<text>` with font-size from CAD cap height
+  (÷ 0.7 em ratio), rotation, oblique angle and width factor. Multi-line MTEXT
+  becomes one `<tspan>` per line at 1.5× pitch, wrapped to the MTEXT rectangle
+  width.
+- **Text metrics are shared** — `server/services/textMetrics.ts` is the single
+  source of truth for how much room a label occupies (per-character advance
+  widths, alignment-aware, rotation-aware). `boundsCalculator` and the
+  renderer's viewport culler both call `textEntityBounds`. This is load-bearing:
+  when the culler sized a label from its **anchor point alone**, any label whose
+  anchor sat outside a viewport's model window was dropped even though its glyphs
+  were visible inside it — the classic "text is missing" bug. Underestimating
+  the same box clips labels at the sheet edge. Alignment is currently fixed to
+  left/baseline (see [Known limitations](#known-limitations)).
+- **Colors** — monochrome is the default: pure black strokes and black labels on
+  white. Substantial filled regions are still painted light grey
+  (`MONOCHROME_HIGHLIGHT_FILL`, `#d4d4d4`) so a hatch or a marked-up area reads
+  as a highlight instead of collapsing into plain black line work; small filled
+  marks stay stroke-only, which is what keeps arrowheads crisp (see
+  [Solid fills](#known-limitations)). `COLOR_MODE=color` is opt-in and uses the
+  resolved entity colors instead, painting `filled` regions in the DWG's own
+  colour at `HIGHLIGHT_FILL_OPACITY`.
 
 ### 6. Rasterization — `pngGenerator.ts`
 
 `sharp` rasterizes the SVG with a white `flatten`, `resize({ fit: "inside",
-withoutEnlargement: true, kernel: lanczos3 })`, and PNG compression level 9.
-No unsharp mask is applied so output stays true to the drawing's line weights.
+withoutEnlargement: true, kernel: lanczos3 })`, and PNG compression level 4
+(a deliberate trade: level 9 costs several seconds per sheet for a few percent of
+size on a line drawing that is downloaded once). No unsharp mask is applied so
+output stays true to the drawing's line weights.
 
 ---
 
@@ -459,33 +512,73 @@ self-contained download/AI target.
 Optional, gated on `GEMINI_API_KEY` being set. Flow:
 
 1. `POST /api/generate/[id]` — validates the id, the key, the rate limit, and
-   that `outputs/{id}.png` exists. An optional `{ prompt }` JSON body carries
-   the user's description of the image they want (length-capped at
-   `MAX_AI_PROMPT_CHARS`, default 1000).
-2. Reads the converted PNG and calls `generateDrawingImage` in
+   that `outputs/{id}.png` exists. The JSON body carries only
+   `{ regenerate?: boolean }`; a `prompt` field is accepted and ignored, since
+   generation is a pure function of (sheet PNG, fixed prompt).
+2. Computes the **AI pair id** — `sha256(sheetId:sha256(viewName):sha256(prompt):sha256(png))`
+   in `server/services/aiPairCache.ts`, deliberately without the per-upload
+   `conversionId` so a re-upload of the same drawing hits the same pair — and
+   reads the pair from Supabase *before* touching the generation budget. A live
+   pair (both objects present, `expiresAt > now`) is returned immediately: no
+   Gemini call, no budget spent. `regenerate: true` is the only way past it.
+3. On a miss, reads the converted PNG and calls `generateDrawingImage` in
    `server/services/geminiImage.ts`:
 
    - `generateContent` to Gemini 3.1 Flash (`gemini-3.1-flash-image`,
      overridable via `GEMINI_MODEL`), payload is `{ parts: [{ inlineData:
      { mimeType: "image/png", data: <base64> } }, { text: prompt }] }`.
-   - `composeAiPrompt` merges the built-in base prompt with the user prompt:
-     the base prompt always runs (it enforces "preserve the drawing, no text,
-     single unified scene"), then the user's request is appended so they can
-     steer style, lighting, materials, etc. Empty/blank prompts fall back to
-     the base prompt alone.
+   - The prompt is `config.geminiPrompt`, verbatim. Nothing is appended — not the
+     sheet's extracted text, not a caller prompt — so the generation is a pure
+     function of its two inputs and the derived cache key is sound.
    - The response is parsed leniently for inline or generated-byte data.
    - A **timeout** (`GEMINI_TIMEOUT_MS`, default 240s) abort maps to a friendly
      `AI_GENERATION_ERROR` ("timed out") instead of a dangling request.
 
-3. Stores `outputs/{id}.ai.png` (+ `.name` sidecar `{base}-ai.png`) and
-   returns the metadata.
-4. `GET /api/download-ai/[id]` serves the generated PNG (same conventions as
+4. Stores `outputs/{id}.ai.png` (+ `.name` sidecar `{base}-ai.png`) and writes
+   the AI pair, then returns the metadata.
+5. `GET /api/download-ai/[id]` serves the generated PNG (same conventions as
    the regular download, including content-type validation client-side).
 
-The default base prompt (`DEFAULT_GEMINI_PROMPT` in `config.ts`) asks Gemini
-to identify the space from the drawing itself and produce a photorealistic,
-**text-free** visualization that preserves the original geometry exactly. It is
-overridable with `GEMINI_PROMPT`.
+The default prompt (`DEFAULT_GEMINI_PROMPT` in `config.ts`) is the
+owner-supplied **"Generic Drawing-to-Realistic-Image Prompt"**: Gemini identifies
+the space/elevation from the drawing itself and produces a single high-resolution
+photorealistic visualization that preserves the drawn design exactly, with **no**
+CAD text in the result. It is stored verbatim as prose — it is the specification
+of what the generated image must be, not generated text — and is overridable
+with `GEMINI_PROMPT`, which wins over the built-in default when set.
+
+The request carries exactly two parts: the selected sheet PNG and that prompt.
+Nothing else is collected or sent — the drawing's own TEXT/MTEXT strings are not
+extracted, stored, or passed to the model. Adding them would make the output
+depend on text that is not part of the pair's identity, which would break cache
+reuse.
+
+### The AI image cache
+
+One prefix is long-lived in Supabase, holding exactly two objects per generation:
+
+| Key | Contents |
+| --- | --- |
+| `ai-outputs/{aiPairId}.ai.png` | the image Gemini returned |
+| `ai-outputs/{aiPairId}.meta.json` | identity fields plus `createdAt` / `expiresAt` |
+
+The input PNG is deliberately **not** stored. It already lives at
+`outputs/{id}.png`, nothing reads its bytes, and the derived id already commits
+to which sheet, prompt and PNG bytes this output belongs to — a second copy
+would roughly double cache storage to guard against a half-written pair, which
+the image-then-metadata write order already prevents.
+
+`aiPairId` is derived, never random: `sha256(sheetId, viewName, promptHash,
+pngHash)`. Every component comes from the drawing's bytes and the configured
+prompt, so a byte-identical DWG uploaded again resolves to the same pair and
+reuses its image. The per-upload `conversionId` is deliberately **excluded** —
+it is a fresh UUID every time, so including it would make every re-upload a miss
+and pay for another Gemini call.
+
+`expiresAt` is set to `now + CACHE_AGE_MINUTES` on every write, and
+`/api/cleanup` deletes a pair only when its own `expiresAt` has passed — reading
+the recorded expiry rather than the storage timestamp, so a pair rewritten
+mid-window is not culled early.
 
 If no key is configured, the endpoint returns `AI_NOT_CONFIGURED` (503).
 
@@ -493,30 +586,50 @@ If no key is configured, the endpoint returns `AI_NOT_CONFIGURED` (503).
 
 ## Configuration reference
 
-`server/config.ts` reads the environment **on every call** (so tests can set
-values without import-order tricks) and returns an `AppConfig`. Paths
-`TEMP_DIR`, `uploadsDir`, `outputsDir` are derived from `TEMP_DIR`.
+`server/config.ts` reads the environment **on every call** (so a value set at
+runtime is picked up without import-order tricks) and returns an `AppConfig`.
+Paths `TEMP_DIR` and `outputsDir` are derived from `TEMP_DIR`.
 
 | Env var | Default | Description |
 | --- | --- | --- |
-| `MAX_FILE_SIZE_MB` | `50` | Upload size limit in MB |
+| `MAX_FILE_SIZE_MB` | `80` | Upload size limit in MB |
 | `MAX_LAYOUTS` | `100` | Max sheets converted per DWG; more layouts → `MULTIPLE_LAYOUTS` rejection. Model crops are merged into the remaining budget |
+| `DROP_BLANK_SHEETS` | `false` | Set to `true` to drop sheets that show no drawing or fall under the ink threshold; off means every sheet becomes a PNG |
+| `BLANK_SHEET_INK_FRACTION` | `0.005` | Ink coverage under which a sheet counts as blank (only when `DROP_BLANK_SHEETS=true`) |
 | `MODEL_CLUSTER_GAP_FRACTION` | `0.03` | Whitespace, as a fraction of the whole model's size, that counts as a gap *between* drawings |
 | `MODEL_CLUSTER_MAX_DEPTH` | `12` | Recursion ceiling for model clustering; caps worst-case crop count |
-| `MAX_AI_PROMPT_CHARS` | `1000` | Max length of the user-supplied AI image prompt |
-| `MAX_PNG_DIMENSION` | `3000` | Max output width/height in px (fitted inside, no upscaling) |
-| `PNG_SUPERSAMPLE` | `2` | Supersample factor for anti-aliasing (rendered large, downscaled) |
+| `MAX_PNG_DIMENSION` | `4500` | Max output width/height in px for paper-space **layout** sheets (fitted inside, no upscaling). Layouts sit at true DWG scale, so extra resolution mostly buys bytes |
+| `MODEL_PNG_DIMENSION` | falls back to `MAX_PNG_DIMENSION` | Max output width/height in px for **model-space crops**. A crop frames the whole drawing, so its labels are always sub-pixel and benefit from extra resolution |
+| `PNG_SUPERSAMPLE` | `2` | Supersample factor for anti-aliasing (rendered large, downscaled). Capped so the canvas never exceeds `MAX_SUPERSAMPLED_EDGE` (6144px), which also means it drops to 1 automatically at 6000px |
 | `MIN_STROKE_PX` | `1` | Minimum stroke thickness in px so hairlines stay visible |
+| `MIN_TEXT_CAP_PX` | `4` | Legibility floor for label cap height in px; labels draw at `max(true size, this)`. **Ignored while `STRICT_TEXT_SCALE` is on**, which is the default — see [Verifying conversion fidelity](#verifying-conversion-fidelity) |
+| `STRICT_TEXT_SCALE` | `true` | Draw labels at their true DWG size. Set to `false` to enforce the `MIN_TEXT_CAP_PX` floor instead, which inflates sub-pixel annotations into labels the source does not contain |
+| `MAX_TEXT_CAP_PX` | `48` | Largest cap height, in output pixels, any label is drawn at. The ceiling that bounds strict mode from above — with no floor in play, one mis-scaled entity height renders as type larger than the sheet. Applies in both strict and non-strict modes |
 | `MARGIN_PX` | `50` | Padding around the drawing, in px |
-| `TEMP_DIR` | `./temp` | Root for uploads/ and outputs/ (relative to `process.cwd()`) |
-| `CLEANUP_AGE_MINUTES` | `1440` | Age after which temp files are swept |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Per-IP requests/minute on convert + generate |
-| `COLOR_MODE` | *(unset)* | `color` → colored (layer/entity) output; default monochrome |
-| `GEMINI_API_KEY` | *(empty)* | Google AI key; empty → AI generation disabled |
+| `TEMP_DIR` | `./temp` | Root for outputs/ on disk (relative to `process.cwd()`); unused when Supabase is configured |
+| `CLEANUP_AGE_MINUTES` | `43200` | Age after which `outputs/` objects are swept (30 days) |
+| `CACHE_AGE_MINUTES` | `43200` | How long a cached AI image stays reusable (30 days) |
+| `UPLOAD_AGE_MINUTES` | `60` | Age after which an orphaned `uploads/` object is swept |
+| `SUPABASE_URL` | *(empty)* | Supabase project URL; enables bucket-backed storage |
+| `SUPABASE_SERVICE_ROLE_KEY` | *(empty)* | Server-only Supabase key; never reaches the browser |
+| `SUPABASE_STORAGE_BUCKET` | `dwg-files` | Private bucket holding outputs, AI images and the AI cache |
+| `AUDIT_TEXT` | unset | Set to `1` to log per-sheet text-coverage fidelity reports (strings present in the SVG, and at what cap height) |
+| `RATE_LIMIT_PER_MINUTE` | `30` | Per-IP requests/minute on convert + generate + tilesview |
+| `COLOR_MODE` | unset | Monochrome (unset) draws black line work and black labels, with substantial filled regions in light grey. Set to `color` for colored (layer/entity) output |
+| `GEMINI_API_KEY` | *(empty)* | Google AI key; empty  AI generation disabled |
 | `GEMINI_MODEL` | `gemini-3.1-flash-image` | Gemini image model id |
-| `GEMINI_PROMPT` | *(built-in)* | Static prompt sent to Gemini with the PNG |
+| `GEMINI_PROMPT` | *(built-in)* | Prompt sent to Gemini verbatim, alongside the sheet PNG and nothing else |
+| `GEMINI_TIMEOUT_MS` | `240000` | Wall-clock cap on one Gemini call, below the route's 300 s |
+| `AI_GENERATION_LIMIT` | `3` | Successful Gemini generations allowed per conversion; `0` means unlimited, so reuse is decided purely by the AI pair cache |
+| `CRON_SECRET` | *(empty)* | Bearer token Vercel Cron must present to `/api/cleanup`; unset means the route refuses everyone |
+| `TILESVIEW_API_URL` | *(set in `.env.example`)* | Room-planner upload endpoint |
+| `TILESVIEW_APP_KEY` / `TILESVIEW_APP_SECRET` | *(empty)* | TilesView credentials; empty  the route returns `TILESVIEW_ERROR` |
+| `TILESVIEW_VISUALIZER_BASE_URL` | *(set in `.env.example`)* | Base URL the returned room id is appended to |
+| `TILESVIEW_APP_KEY_HEADER` / `TILESVIEW_APP_SECRET_HEADER` | `app_key` / `app_secret` | Auth header names, only change if the provider renames them |
 
-`ensureTempDirs(config)` creates `uploads/` and `outputs/` when needed.
+`ensureTempDirs(config)` creates `outputs/` when needed, and is best-effort: on
+Vercel the bundle directory is read-only, so an unwritable temp root must not
+fail the request.
 
 ---
 
@@ -531,9 +644,24 @@ All JSON error responses share the shape:
 The `error` string is the **user-facing** message for the mapped code — never
 an internal stack trace (see [Errors](#errors--rate-limiting)).
 
+### `GET|POST /api/upload`
+
+A tombstone that answers **404** to both methods. Direct-to-storage upload is
+removed: a signed PUT URL is a durable public handle on DWG bytes, and nothing
+here needs one. `/api/convert` still accepts a JSON `uploadPath`, so a DWG
+staged by an earlier version of this app (or written out of band) can still be
+converted; only the minting side is gone.
+
 ### `POST /api/convert`
 
-Multipart form-data, field `file` (`*.dwg`).
+Accepts either:
+
+- `multipart/form-data` with a `file` field (`*.dwg`) — the only path the browser
+  uses, and
+- JSON `{ uploadPath, fileName }` — naming a DWG already staged in storage.
+
+In the JSON case the size check runs against the bytes actually read back, not
+anything the client claimed.
 
 - Runtime: `nodejs`, `maxDuration: 300`.
 - Validates: extension, size, DWG signature/version, sheet count, rate limit.
@@ -562,8 +690,9 @@ Multipart form-data, field `file` (`*.dwg`).
 }
 ```
 
-- **4xx/5xx** on failure (see error table); the temp upload is deleted either
-  way.
+- **4xx/5xx** on failure (see error table); any staged upload (`uploadPath`)
+  is deleted either way. In multipart mode the temporary disk file is removed
+  in `finally`.
 - `GET` returns 405 with a hint.
 
 ### `POST /api/generate/[id]`
@@ -571,14 +700,27 @@ Multipart form-data, field `file` (`*.dwg`).
 Generates the AI image for an existing sheet conversion. Requires
 `GEMINI_API_KEY`.
 
-- Body: optional JSON `{ "prompt": "..." }` — the user's description of the
-  image they want. It is appended to the built-in base prompt. Prompts longer
-  than `MAX_AI_PROMPT_CHARS` are rejected with 400. Blank/missing prompts fall
-  back to the base prompt alone.
+- Body: optional JSON `{ "regenerate": true }`. The flag bypasses the pair cache
+  and spends a generation. A `prompt` field is accepted and **ignored**: the
+  prompt is fixed by `GEMINI_PROMPT`, so a per-request one would break the cache
+  key without changing what the model receives.
 - Validates: id format, key present, rate limit, output file exists.
-- **200** → `{ success, conversionId, fileName, size, durationMs }`.
-- **503** `AI_NOT_CONFIGURED` when the key is missing; **404** `FILE_NOT_FOUND`
-  when the PNG is gone.
+- **200** → `{ success, conversionId, fileName, size, durationMs,
+  generationsUsed, generationsLimit, cached, source, blocked }`. `cached: true`
+  (with `source: "cached-pair"`) means the image came from the AI pair cache: no
+  Gemini call, no generation consumed, `durationMs: 0`, and `blocked: true` so
+  the UI stops offering regeneration.
+- The cache is consulted **before** the generation allowance is charged, so a
+  re-requested drawing still succeeds after the limit is reached. Otherwise the
+  route claims one generation atomically (under a per-conversion lock, so two
+  concurrent clicks cannot both slip past the cap) and releases it again if
+  Gemini or the save fails — a failed attempt is not billed.
+- The claim counter lives in the output store, so it is shared across warm
+  instances of the same deployment but **not** across separate deployments or
+  after the count object is swept with its output.
+- **429** `AI_LIMIT_REACHED` carrying `generationsLimit`, so a client can stop
+  offering the button; **503** `AI_NOT_CONFIGURED` when the key is missing;
+  **404** `FILE_NOT_FOUND` when the PNG is gone.
 
 ### `GET /api/download/[id]`
 
@@ -592,6 +734,30 @@ reclaims it.
 Serves `{id}.ai.png` with the same semantics; name sidecar defaults to
 `dwg-ai-generation.png`.
 
+### `POST /api/tilesview/[id]`
+
+Publishes an already-generated AI image to TilesView and returns the room to
+open. Requires `TILESVIEW_APP_KEY` / `TILESVIEW_APP_SECRET`.
+
+- Validates: id format, credentials present, rate limit, `{id}.ai.png` exists —
+  so an AI image must be generated first.
+- **200** → `{ success, conversionId, customRoomsId, visualizerUrl }`.
+- `maxDuration = 60`. The UI opens a blank tab synchronously inside the click
+  and navigates it to `visualizerUrl` on success, because user activation often
+  expires during the upload and the popup would otherwise be blocked.
+
+### `GET /api/cleanup`
+
+Daily cron target. Sweeps `outputs/` and `uploads/` on their age clocks plus
+cached AI images on their own `expiresAt`, and answers `{ success, removed,
+aiRemoved }`.
+
+- Requires `Authorization: Bearer $CRON_SECRET`; anything else gets a 401. When
+  `CRON_SECRET` is unset the route refuses everyone rather than defaulting open.
+- `POST` returns 405. On failure the underlying error is logged but never echoed
+  back (it contains file paths and bucket names), and `Retry-After: 3600` is
+  set.
+
 ---
 
 ## Errors & rate limiting
@@ -604,14 +770,17 @@ produces the user message and HTTP status so UI and API never drift.
 | `INVALID_FILE` | 400 | The uploaded file could not be read. |
 | `UNSUPPORTED_EXTENSION` | 400 | Only DWG files are supported. |
 | `FILE_TOO_LARGE` | 400 | File size exceeds the allowed limit. |
-| `RATE_LIMITED` | 400 | Too many requests. Please try again shortly. |
+| `RATE_LIMITED` | 429 | Too many requests. Please try again shortly. |
 | `CORRUPTED_DWG` | 422 | Unable to read DWG file. It may be corrupted or password-protected. |
 | `UNSUPPORTED_DWG_VERSION` | 422 | Unsupported DWG version. R13 (AC1012) and newer are supported. |
 | `MULTIPLE_LAYOUTS` | 422 | This DWG contains more than one drawing… |
 | `PARSER_ERROR` | 422 | The DWG file could not be parsed. |
 | `NO_DRAWABLE_CONTENT` | 422 | No drawable content was found in this DWG file. |
 | `FILE_NOT_FOUND` | 404 | The requested conversion result no longer exists. |
+
 | `AI_NOT_CONFIGURED` | 503 | AI image generation is not configured on this server. |
+| `AI_LIMIT_REACHED` | 429 | You've reached the maximum number of AI image generations for this drawing. |
+| `STORAGE_UNAVAILABLE` | 503 | The storage service is temporarily unavailable. Please try again later. |
 | `RENDER_ERROR` | 500 | The drawing could not be rendered. |
 | `PNG_GENERATION_ERROR` | 500 | The PNG image could not be generated. |
 | `AI_GENERATION_ERROR` | 500 | The AI image could not be generated. Please try again. |
@@ -623,37 +792,99 @@ message keywords ("unsupported"/"version" → `UNSUPPORTED_DWG_VERSION`,
 "corrupt"/"magic"/"header" → `CORRUPTED_DWG`, "render"/"svg" →
 `RENDER_ERROR`, "gemini"/"ai image" → `AI_GENERATION_ERROR`, …).
 
-Rate limiting is a per-IP sliding window (`utils/rateLimit.ts`,
-`takeRateLimit(ip, max, windowMs)`), keyed off `x-forwarded-for` /
-`x-real-ip`, applied to convert and generate.
+Rate limiting is a per-IP **fixed** window (`utils/rateLimit.ts`,
+`takeRateLimit(ip, max, windowMs)`), applied to convert and generate. The client
+IP comes from `clientIpFrom(headers)`, which trusts `x-vercel-forwarded-for`
+first, then the *right-most* `x-forwarded-for` entry (the one a trusted proxy
+appended — left-most entries are caller-controlled and ignored so a forged
+header cannot mint a fresh bucket per request), then `x-real-ip`. Equivalent
+spellings of one address (`::ffff:1.2.3.4` vs `1.2.3.4`) are collapsed to a
+single key. The window map is capped at 10,000 entries, evicting the
+soonest-to-expire client when full. In-memory state is per instance, so the
+effective limit is multiplied by the number of warm instances.
 
 ---
 
 ## Storage & file lifecycle
 
-`server/utils/storage.ts` owns everything on disk:
+`server/services/supabaseStore.ts` is the only module that talks to the bucket.
+`outputStore` and `uploadStore` call it, and fall back to disk when
+`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are unset, so local dev needs no
+credentials.
+
+- **Why a bucket at all** — a converted PNG has to outlive the single
+  `convert` request that produced it: the browser previews it and then calls
+  `generate/[id]`, and the download routes re-serve it. Local files die with a
+  serverless instance, so production output lives in a **private** Supabase
+  Storage bucket, namespaced by prefix:
+
+  ```
+  outputs/{id}.png            # converted sheet PNG
+           {id}.png.meta      # sourceHash / pngHash / sheetId / viewName
+           {id}.png.name      # output filename sidecar (UTF-8)
+           {id}.ai.png        # AI result
+           {id}.ai.png.name   # AI filename sidecar
+           {id}.ai.png.count  # successful generations (generation limit)
+  ai-outputs/{aiPairId}.ai.png # the image Gemini returned
+  ai-outputs/{aiPairId}.meta.json # identity + createdAt / expiresAt
+  uploads/{uuid}.dwg          # staged DWG; deleted right after conversion
+  ```
+
+  The prefix split is what lets retention differ per group: `outputs/` lives for
+  `CLEANUP_AGE_MINUTES` and `ai-outputs/` for `CACHE_AGE_MINUTES`, while
+  `uploads/` exists only for the length of one conversion. Without Supabase
+  nothing is persisted at all, so every request costs a Gemini call.
+
+  `outputs/` holds **both** the converted PNG and the generated AI image for the
+  same conversion, so a single `CLEANUP_AGE_MINUTES` window covers both. It is
+  measured from conversion, not from last download: a sheet fetched on day 29
+  is still reclaimed on day 30.
+
+  No sheet PNG is duplicated: it is written once to `outputs/`, and the AI cache
+  stores only the image Gemini returned. A re-uploaded DWG is recognised by the
+  `sheetId` and `pngHash` in the `{id}.png.meta` sidecar, which together make up
+  the AI pair identity.
 
 - **IDs** — `newConversionId()` = `randomUUID()`. `isSafeConversionId` enforces
   the strict UUID pattern on every route that accepts an id, so path traversal
-  is impossible.
-- **Layout on disk** under `TEMP_DIR`:
+  is impossible. A staged `uploadPath` is additionally checked against
+  `uploads/{uuid}.dwg` by `isTrustedUploadPath`.
+- **Uploads** — the browser always POSTs multipart to `/api/convert`, so a DWG
+  is bounded by the platform's request-body limit (~4.5 MB), not by
+  `MAX_FILE_SIZE_MB`. The signed-URL path that used to bypass it is removed.
+- **On disk** (no Supabase credentials), under `TEMP_DIR`:
 
   ```
-  temp/
-  ├── uploads/{id}.dwg        # deleted after conversion (finally block)
-  └── outputs/{id}.png        # consumed by download + generate routes
-                 {id}.png.name         # output filename sidecar (UTF-8)
-                 {id}.ai.png           # AI result
-                 {id}.ai.png.name      # AI filename sidecar
+  temp/outputs/{id}.png (+ .meta / .name / .ai.png / .ai.png.name / .ai.png.count)
   ```
+
+  There is no `uploads/` dir: the multipart path converts straight out of the
+  request buffer and never stages the file.
 
 - **Atomic writes** — `writeBufferFileAtomic` writes to a unique sibling
   `*.tmp` and `rename`s over the destination, so a concurrent download can
   never observe a partial file.
-- **Sweep** — `fileCleanup.sweepTempDirs` removes files older than
-  `CLEANUP_AGE_MINUTES`, invoked opportunistically from the convert, generate,
-  and download routes (always after the requested file has been read, so a
-  conversion can never sweep itself away).
+- **Sweep** — buckets are swept by prefix: `fileCleanup.sweepTempDirs` on disk,
+  and `list` + batched `remove` against the bucket when Supabase is enabled.
+  Keys are collected in a read-only pass *before* anything is deleted, because
+Supabase pages `list` by offset and deleting mid-scan would skip live objects.
+  The `ai-outputs/` pairs are swept by `sweepExpiredAiPairs`, which reads each
+  pair's own recorded `expiresAt` rather than the storage timestamp.
+  Invoked opportunistically from the convert, generate, and download routes
+  (throttled to at most once per 10 minutes per process) and, unconditionally,
+  by the daily cron. Each route runs the sweep only after it has read whatever
+  object it is about to use, so the sweep cannot delete the object the request
+  is working on.
+`GET /api/cleanup` is the single cleanup entrypoint for the project: it sweeps
+   `outputs/`, `ai-outputs/` and orphaned `uploads/` in one pass, and refuses to
+   run without the `CRON_SECRET` bearer token. There is no separate CLI
+   entrypoint — a second sweeper would need its own copy of the retention
+   windows and would drift, which is how the AI cache came to be missed by an
+   older manual script.
+- **Size limits** — `MAX_FILE_SIZE_MB` is enforced by `/api/convert` against the
+  bytes it reads, and a `413` from the platform is reported as such. In practice
+  the platform's request-body cap (~4.5 MB) bites first, so a DWG larger than
+  that cannot be converted at all while the direct-upload path is gone.
 
 ---
 
@@ -663,15 +894,17 @@ Rate limiting is a per-IP sliding window (`utils/rateLimit.ts`,
 
 | Command | Purpose |
 | --- | --- |
-| `npm run dev` | Next dev server (wrapped by `scripts/with-heap.mjs`) |
-| `npm run build` | Production build (`next build` with heap tuning) |
+| `npm run dev` | Next dev server |
+| `npm run build` | Production build (`next build`) |
 | `npm run start` | Serve the production build |
 | `npm run lint` | ESLint (flat config, `eslint.config.mjs`) |
-| `npm test` | `vitest run` — unit + integration |
 | `npx tsc --noEmit` | Type checking |
 
-`scripts/with-heap.mjs` launches node with a larger heap (the acad-ts parse and
-sharp rasterization of large files need it).
+Node's default heap (~4 GB) is usually enough; for very large drawings the
+acad-ts parse and sharp rasterization can exhaust it in `npm run dev` /
+`npm run start`. If that happens, raise it explicitly:
+`NODE_OPTIONS=--max-old-space-size=8192 npm run dev` (PowerShell:
+`$env:NODE_OPTIONS="--max-old-space-size=8192"; npm run dev`).
 
 ### Environment
 
@@ -680,27 +913,125 @@ Copy `frontend/.env.example` → `frontend/.env` (Next.js auto-loads it from the
 
 ### Testing
 
-Vitest covers:
+There is **no automated test suite** in this repository — no test runner is
+installed and no test files are checked in. Correctness is established with:
 
-- `convertDwg` orchestration decisions: sheet selection (all layouts, then the
-  model crops, Model fallback, `MAX_LAYOUTS` cap → `MULTIPLE_LAYOUTS`
-  rejection).
-- `modelClusterer` gap splitting: wide gaps separate drawings, sub-threshold
-  gaps do not, both axes are handled, recursion is depth-bounded, straddling
-  entities are never duplicated, and the budget merge never loses entities.
-- API routes (`convert`, `generate`, `download`, `download-ai`) with fake
-  reader ports, throwaway `TEMP_DIR`s, and in-memory FormData.
-- Pure functions: geometry, line weights, coordinate mapping, bounds,
-  normalization, error mapping, rate limiting, storage.
-
-Real-DWG verification is done with a small throwaway test file placed under
-`frontend/temp/uploads/` (it is created, run, then deleted) — the repo's real
-samples stay out of git. The same directory holds the fixtures used by the
-integration tests.
+- `npx tsc --noEmit` and `npm run lint` for static checks.
+- `npm run build` to confirm the app compiles for production.
+- **Real-DWG verification**: drop a throwaway DWG under
+  `frontend/temp/uploads/` (created, run, then deleted), convert it, and compare
+  the emitted PNGs against the layouts shown in AutoCAD. The repo's real samples
+  stay out of git.
 
 ---
 
-## Known limitations
+## Verifying conversion fidelity
+
+Set `AUDIT_TEXT=1` to make every conversion log a per-sheet text-fidelity report
+alongside the usual progress lines:
+
+```
+Text audit "ELEVATION AA (2)": 103/103 strings (100.0%), minCap=12.30px, belowFloor=0, invalid=0 -> PASS
+```
+
+Each line answers three questions that eyeballing a PNG cannot separate:
+
+- **coverage** — how many of the strings the sheet is supposed to show reached
+  the SVG, and which are missing (named explicitly);
+- **`belowFloor`** — labels emitted under `MIN_TEXT_CAP_PX`, i.e. present in the
+  vector output but effectively invisible in the raster;
+- **`invalid`** — labels with non-finite geometry (`x="NaN"`), which rasterizers
+  skip silently, leaving a sheet that looks blank of text while containing every
+  right string.
+
+`FAIL` on any of coverage, `belowFloor` or `invalid` means the sheet is not
+faithful and the missing strings are listed.
+
+### What "faithful" is verified to mean
+
+Measured on a real 3.3 MB architectural DWG (26 paper-space layouts, 314,838
+normalized entities, 1,867 text entities, model extent ~120,000 units):
+
+| Property | Result |
+| --- | --- |
+| Text anchored on its true DWG coordinate | 1,867 / 1,867 |
+| Text inside model bounds | 1,866 / 1,867 |
+| Sheets at 100% string coverage | 28 / 28 (2,365 / 2,365 strings) |
+| Labels below the legibility floor | 0 |
+| Labels with non-finite geometry | 0 |
+| Layouts kept by the blank-sheet filter | 26 / 26 |
+| Same DWG converted twice → identical PNG bytes | yes |
+
+Determinism matters beyond fidelity: the AI pair cache is keyed on the sha256 of
+the converted PNG, so byte-identical output is what lets a re-uploaded DWG reuse
+its previous AI image instead of paying for another generation.
+
+### Label size: the one deliberate deviation
+
+Labels are drawn at `max(true size, MIN_TEXT_CAP_PX)`. That floor is **not**
+present in the DWG, and on a large drawing it is a substantial distortion — it
+exists because the alternative is worse. Annotation is millimetres tall: on a
+drawing whose model crop spans ~63,000 units, the median label is 3 units, which
+is **0.15px at 3000px**. Rendered at true size it is sub-pixel — present in the
+SVG, invisible in the PNG. No practical canvas fixes that (4px honestly would
+need ~84,000px), so the floor trades exact relative sizing for legibility.
+
+Measured inflation per view class, with model crops at `MODEL_PNG_DIMENSION=6000`
+and layouts at `MAX_PNG_DIMENSION=3000`:
+
+| View | Labels | Median inflation | Notes |
+| --- | --- | --- | --- |
+| 26 paper-space layouts | 12–16 each | **1.00x** | Floor never binds; already true DWG scale, nothing added |
+| `FLOORING LAYOUT 1 (3)` | 16 | 1.00x | One label floored (worst case 3.85x) |
+| Whole-model crop | 31 | ~13x | Every label sub-pixel; the only genuinely distorted view |
+
+The layout figures are the important ones: for the sheets a person actually reads,
+output is at true scale. Only the whole-model crop is inflated, and AutoCAD shows
+no readable text at that zoom either.
+
+Note the floor also flattens the text *hierarchy* on a model crop — in the DWG
+those 31 labels span a 125x size range, and after the floor they are all identical.
+Raising `MODEL_PNG_DIMENSION` is the only thing that reduces it.
+
+### Label size: the ceiling, and oversized dimensions
+
+The floor is off by default (`STRICT_TEXT_SCALE=true`), which removes the
+inflation but leaves text sized purely as `entity.height × viewport.scale` — and
+`viewport.scale` is unbounded above, because a small sheet produces a large scale.
+Nothing upstream bounded `entity.height` either. Two gaps followed.
+
+**Dimension text.** A dimension's measured value lives in its anonymous `*D` block,
+which `expandDimensionBlock` flattens into ordinary `TEXT`/`MTEXT`. That MTEXT
+sometimes stores a height of `0`, and `textEntityHeight` then fell through to
+`DEFAULT_TEXT_HEIGHT` — `1` unit. acad-ts's own default dimension text height is
+`0.18`, so the fallback was ~5.5x too big: on a 36-unit sheet at 3000px, ~115px of
+type where a real annotation is 8px. The dimension's style knows the intended size,
+so `dimensionStyleTextHeight` reads `textHeight × scaleFactor` off
+`getActiveDimensionStyle()` (scaled like `extractLeader` scales arrow size) and
+`textEntityHeight` prefers it over the generic default. Text style heights still win
+when the entity has one; the dimension style is only consulted when neither the
+entity nor its text style is usable.
+
+**The ceiling.** Anything with a genuinely bad height still needs a bound, since
+`STRICT_TEXT_SCALE` cannot supply one. `MAX_TEXT_CAP_PX` (default `48`) caps cap
+height in both modes: `clamp(true size, MIN_TEXT_CAP_PX, MAX_TEXT_CAP_PX)`. 48px of
+cap height (~69px font) sits far above any label genuinely part of a drawing —
+title blocks and section marks are the largest — so correct text is untouched and
+only a runaway is clamped. Raise it if a drawing has labels larger than that; set
+it very high to disable.
+
+The two settings bound opposite ends of the same problem and neither is sufficient
+alone: strict mode has no floor, so it needs the cap; non-strict mode has no cap,
+so it needs the floor.
+
+### What is *not* claimed
+
+Conversion is geometrically faithful for everything the parser can resolve, but it
+is not a pixel-for-pixel match with AutoCAD's plot output — see
+[Known limitations](#known-limitations) for the specific gaps (sub-pixel hairlines,
+substituted SHX glyphs, unresolved XREFs, OLE/underlay frames).
+
+---
 
 - **Model crops share the layout budget** — layouts are emitted first, and the
   model crops get whatever slots remain under `MAX_LAYOUTS` (default 100). A DWG
@@ -711,20 +1042,69 @@ integration tests.
   size, which keeps a dense drawing intact but means an extreme outlier
   (a stray note orders of magnitude away) can inflate the reference size and
   mask the real gaps between drawings.
-- **Text alignment** — `textAlignment` in `entityExtractor.ts` currently
-  returns a constant left/baseline alignment; CAD horizontal/vertical alignment
-  flags are parsed but not applied yet.
-- **DWG versions** — R13 (`AC1012`) through 2018+ (`AC1032`) are accepted.
-  `AC1032` also covers AutoCAD 2019–2027, since the format has not changed
-  since 2018. Pre-R13 files fail signature/version validation, and would fail
-  in the parser anyway: `acad-ts` throws `CadNotSupportedException` for
-  `AC1002`–`AC1009`.
+- **Text anchoring** — `textAlignment` in `entityExtractor.ts` maps the CAD
+  horizontal/vertical alignment flags (and `TextEntity.horizontalMode` /
+  `verticalMode` for `TEXT`, the attachment point for `MTEXT`). AutoCAD stores
+  the anchor in `alignmentPoint` only when the text is not left/baseline aligned,
+  so `textPosition` prefers it and falls back to the group-10 `insertPoint`.
+  `alignmentPoint` is honoured **only when it holds a real coordinate**: `acad-ts`
+  does not read that field from the DWG and leaves a unit *direction* vector there
+  instead — across the 1,867 text entities of a real architectural drawing every
+  value had magnitude 1 (`(1,0)`, `(0,1)`, `(0,-1)`, and rotations such as
+  `(0.99998, 0.00473)`). Trusting it drew all 817 dimension values plus every
+  centred label at the origin, ~100,000 units from the geometry they annotate,
+  which is what made dimension text read as missing. `isUnusableAlignmentPoint`
+  rejects unit-magnitude points so those labels fall back to `insertPoint`.
+  One caveat remains: the vertical anchor is applied as a fixed baseline shift in
+  the SVG (cap- and x-height fractions of the font size) instead of a true
+  text-box fit. Text extents are measured from real per-character advance widths
+  shared by the bounds calculator and the viewport culler (`textMetrics.ts`), but
+  the CAD text **font itself** is substituted: a `romans.shx`/`txt.shx` label is
+  drawn in a generic sans, so letterforms and exact string widths differ from
+  AutoCAD.
+- **Not pixel-identical to AutoCAD** — `acad-ts` is a partial DWG reader, so
+  output is *geometrically equivalent with all resolvable text present*, not
+  pixel-parity. Known gaps: no SHX/TTF CAD fonts, XREF/external block references
+  are not resolved (their content is absent from the output), OLE objects and
+  underlays render as frames rather than their embedded raster, annotative
+  scaling is not evaluated, and AutoCAD's own plot drivers/styling differ again.
+  Anything unresolvable is reported as a conversion warning rather than dropped
+  silently. Reaching true parity means changing engine (Autodesk APS Model
+  Derivative or ODA Drawings SDK), not changing this code.
+- **DWG versions** — R13 (`AC1012`) through `AC1032` are accepted. `AC1032`
+  is the version used by AutoCAD 2018 and every release since, so it covers
+  current AutoCAD too. Pre-R13 files fail signature/version validation, and
+  would fail in the parser anyway: `acad-ts` throws `CadNotSupportedException`
+  for `AC1002`–`AC1009`.
 - **Unsupported entity types** are counted and reported as warnings rather than
   rendered (see `SUPPORTED_ENTITY_TYPES`). Notable: splines are tessellated to
   polylines (faithful, but heavy).
 - **Blocks table** — named blocks are not pre-normalized; only inserted block
   instances are expanded (avoids wasting CPU on never-inserted definitions).
+- **Solid fills** — a `SOLID`/`3DFACE` polygon, an expanded solid hatch and a
+  leader arrowhead all record the DWG's fill intent in `Entity.filled`. In
+  **monochrome** a `filled` region is painted light grey
+  (`MONOCHROME_HIGHLIGHT_FILL`, `#d4d4d4`) when it covers at least
+  `MONOCHROME_HIGHLIGHT_MIN_AREA_FRACTION` (0.05%) of the drawing's own bounds,
+  and stroked in black otherwise. Reusing the stroke colour as the fill forced
+  `#000000` (and `resolveColorHex` rewrites near-white to black as well), so one
+  large filled region painted over a third of the sheet and buried the line work
+  — `Fluting sample display (2)` measured 33.8% ink coverage before, 15.3% after.
+  The area threshold is what excludes arrowheads: they are `filled` `SOLID`s too,
+  but a fraction of a percent of a sheet, and grey-filling them put a blob next to
+  every dimension. Measuring against the drawing's bounds rather than an absolute
+  unit area keeps the threshold meaningful on a 36-unit sheet and a 4,000-unit site
+  plan alike. In **color mode** (`COLOR_MODE=color`) the DWG's own colour is kept
+  and every `filled` region is painted at `HIGHLIGHT_FILL_OPACITY` (0.2), which
+  is what makes a highlight legible without letting the fill bury the line work.
+  Light-grey fill departs from AutoCAD, whose default `monochrome.ctb` plots
+  solid hatches as solid black.
 - **Color extremes** — near-white colors resolve to black for stroke
-  visibility on the white background.
+  visibility on the white background. This applies to strokes only, never to
+  fills.
 - **AI image** — requires a configured `GEMINI_API_KEY`; generation is
-  time-boxed at 90 seconds server-side.
+  time-boxed at 240 seconds server-side (`GEMINI_TIMEOUT_MS`).
+- **Per-instance state** — rate-limit windows and the in-flight AI generation
+  claim locks live in process memory. On a multi-instance deployment the
+  effective per-IP limit and the generation limit are therefore per instance
+  (a shared store would be needed to enforce them globally).

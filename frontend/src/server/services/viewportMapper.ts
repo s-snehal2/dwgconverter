@@ -1,4 +1,4 @@
-import type { PageViewport } from "../models/page";
+import { isUsableViewHeight, type PageViewport } from "../models/page";
 import type { CadPoint, Entity } from "../models/entity";
 
 /**
@@ -13,7 +13,7 @@ import type { CadPoint, Entity } from "../models/entity";
  */
 
 function viewportScale(vp: PageViewport): number {
-  return vp.viewHeight === 0 || !Number.isFinite(vp.viewHeight) ? 1 : vp.height / vp.viewHeight;
+  return isUsableViewHeight(vp.viewHeight) ? vp.height / vp.viewHeight : 1;
 }
 
 /** Map one model point into page coordinates through a viewport window. */

@@ -19,6 +19,19 @@ interface EntityBase {
   lineType?: string;
   /** Original DWG entity class name (for reporting). */
   sourceType: string;
+  /**
+   * True when this entity was expanded out of a DIMENSION's anonymous `*D`
+   * block: the dimension line, its extension lines, arrowheads and the measured
+   * value.
+   *
+   * Without this marker a dimension value is byte-for-byte indistinguishable
+   * from an ordinary MTEXT label, because the expansion flattens the block and
+   * the value keeps its own `sourceType` of "MTEXT". Two things need the origin
+   * to behave correctly: dimension text must fall back to the dimension style's
+   * text height instead of a generic drawing-unit default, and arrowheads must
+   * not be mistaken for filled highlights. Set by `expandDimensionBlock`.
+   */
+  fromDimension?: boolean;
 }
 
 export interface LineEntity extends EntityBase {
@@ -75,6 +88,10 @@ export interface TextEntity extends EntityBase {
   height: number;
   text: string;
   alignment: TextAlignment;
+  /** DWG horizontal character scale (ACAD `widthFactor`), defaults to 1. */
+  widthFactor?: number;
+  /** DWG oblique angle in radians (ACAD `obliqueAngle`), defaults to 0. */
+  oblique?: number;
 }
 
 export interface MTextEntity extends EntityBase {
@@ -88,9 +105,17 @@ export interface MTextEntity extends EntityBase {
 }
 
 /**
- * A filled or outlined polygon: maps DWG SOLID / 3DFACE entities and solid
- * hatch fills. `filled` shapes get a solid fill; otherwise only the outline
- * is stroked.
+ * A polygon: maps DWG SOLID / 3DFACE entities, solid hatch boundaries and
+ * leader arrowheads.
+ *
+ * `filled` records the DWG's own fill intent, so the model stays faithful to
+ * the source. In color mode (`COLOR_MODE=color`) the renderer paints it in the
+ * DWG's own colour at low opacity, because that is what makes a highlight read
+ * as a highlight. In monochrome — the default — it paints it light grey, but only
+ * when the region covers a meaningful share of the sheet; every entity strokes
+ * `#000000` there, so honouring the flag indiscriminately filled whole regions
+ * solid black and buried the line work, and it turned arrowheads into grey
+ * blobs. See `renderSolid` in `renderer.ts`.
  */
 export interface SolidEntity extends EntityBase {
   type: "SOLID";

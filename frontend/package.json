@@ -3,14 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node scripts/with-heap.mjs next dev",
-    "build": "node scripts/with-heap.mjs next build",
-    "start": "node scripts/with-heap.mjs next start",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
     "@node-projects/acad-ts": "^3.1.0",
-    "@vercel/blob": "^2.8.0",
+    "@supabase/supabase-js": "^2.117.2",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.2.5",
     "lucide-react": "^1.41.0",

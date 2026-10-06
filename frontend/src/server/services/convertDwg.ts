@@ -2,6 +2,8 @@ import { createDwgReader, type DwgReaderPort, type RawDwgData } from "./dwgReade
 import { parseViews, type ConversionStatistics, type ParsedView } from "./dwgParser";
 import { renderToSvg, type RenderOptions } from "./renderer";
 import { generatePng, rasterInkFraction } from "./pngGenerator";
+
+import { auditSheetTextCoverage } from "./textCoverage";
 import { partitionRenderable, type OmittedSheet } from "./blankSheet";
 import {
   clusterModelEntities,
@@ -104,9 +106,11 @@ function expandModelView(
     drawing: { ...model.drawing, entities: cluster.entities, bounds: cluster.bounds },
     statistics: {
       ...model.statistics,
-      totalEntities: cluster.entities.length,
+      // The crop shows this many of the model's entities; the parse-time
+      // totals are preserved so "skipped" stays honest instead of reading 0.
+      totalEntities: model.statistics.totalEntities,
       renderedEntities: cluster.entities.length,
-      skippedEntities: 0,
+      skippedEntities: model.statistics.skippedEntities,
     },
   }));
 }
@@ -210,7 +214,10 @@ export async function renderViewPng(
 ): Promise<ConversionOutput> {
   const started = Date.now();
   const renderStart = Date.now();
-  const maxDimension = config.maxPngDimension;
+  // A model crop frames the whole drawing, so its labels are always sub-pixel
+  // and benefit from extra resolution; layouts are already at true scale and
+  // gain nothing but bytes. See `AppConfig.modelPngDimension`.
+  const maxDimension = view.isModel ? config.modelPngDimension : config.maxPngDimension;
   logger.info?.(
     `Rendering view "${view.name}"${view.isModel ? "" : " (layout)"} at up to ${maxDimension}px.`
   );
@@ -222,7 +229,10 @@ export async function renderViewPng(
       maxHeight: maxDimension,
       margin: config.marginPx,
       minStrokePx: config.minStrokePx,
+      minTextCapPx: config.minTextCapPx,
+      maxTextCapPx: config.maxTextCapPx,
       supersample: supersampleForEntities(view.drawing.entities.length, config.pngSupersample),
+      strictTextScale: config.strictTextScale,
     };
     const svg = renderToSvg(view.drawing, options);
     const png = await generatePng(svg, {
@@ -231,6 +241,33 @@ export async function renderViewPng(
     });
     const renderDurationMs = Date.now() - renderStart;
     logger.info?.(`Rendered SVG and generated PNG (${png.byteLength} bytes) in ${renderDurationMs}ms.`);
+    // Opt-in fidelity audit. It answers the question a PNG cannot: did every
+    // string this sheet is supposed to show survive into the SVG, and did it
+    // survive at a legible size? Cheap next to rendering, so it is left off by
+    // default and switched on per deployment.
+    if ((process.env.AUDIT_TEXT ?? "").trim() === "1") {
+      try {
+        const report = auditSheetTextCoverage(view.drawing, svg, {
+          sheetName: view.name,
+          isModel: view.isModel,
+          // With strict scale on there is no floor in the render, so the audit
+          // must not judge against one either.
+          minCapHeightPx: config.strictTextScale ? 0 : config.minTextCapPx,
+        });
+        logger.info?.(
+          `Text audit "${report.sheet}": ${report.present}/${report.expected} strings` +
+            ` (${(report.coverage * 100).toFixed(1)}%), minCap=${report.minCapHeightPx.toFixed(2)}px,` +
+            ` belowFloor=${report.belowFloor}, invalid=${report.invalid} -> ${report.ok ? "PASS" : "FAIL"}` +
+            (report.missing.length > 0 ? `; missing: ${report.missing.slice(0, 10).join(", ")}` : "")
+        );
+      } catch (auditErr) {
+        logger.info?.(
+          `Text audit "${view.name}" failed to run: ${
+            auditErr instanceof Error ? auditErr.message : String(auditErr)
+          }`
+        );
+      }
+    }
     return {
       png,
       statistics: view.statistics,
@@ -252,10 +289,10 @@ export async function renderViewPng(
 
 /**
  * The multi-sheet conversion orchestrator: inspect → select every drawable
- * sheet → drop the ones that show no drawing → render the rest to PNG.
+ * sheet → render each to PNG.
  *
- * Two independent conditions must hold before a sheet becomes a PNG, because
- * they catch different failures:
+ * Two independent blank tests exist for when dropping is enabled
+ * (`DROP_BLANK_SHEETS=true`):
  *
  * 1. **It shows a drawing** (`hasSheetDrawing`) — for a layout, model geometry
  *    must land inside one of its viewport windows; for a model crop, the crop
@@ -265,10 +302,13 @@ export async function renderViewPng(
  * 2. **It clears `config.blankSheetInkFraction`** — a sheet can hold geometry
  *    yet still render nearly empty, which is a blank page to a reader.
  *
- * A sheet failing either test is never rendered to storage; its name and reason
- * come back in `omittedBlankSheets`. A DWG with more renderable paper-space
- * layouts than `config.maxLayouts` is rejected with MULTIPLE_LAYOUTS, and a DWG
- * whose sheets are *all* blank is rejected with NO_DRAWABLE_CONTENT.
+ * Dropping is off by default, in which case every selected sheet renders and
+ * `omittedBlankSheets` is always empty: heuristics must never silently eat a
+ * real drawing. A sheet failing either test (when enabled) is never rendered
+ * to storage; its name and reason come back in `omittedBlankSheets`. A DWG
+ * with more renderable paper-space layouts than `config.maxLayouts` is
+ * rejected with MULTIPLE_LAYOUTS, and a DWG whose sheets are *all* blank is
+ * rejected with NO_DRAWABLE_CONTENT.
  */
 export interface ConvertSummary {
   /** Every sheet that passed both tests, in draw order. */
@@ -302,8 +342,14 @@ export async function convertDwg(
 
   // The unclustered model space is the source of geometry for the viewport
   // test; a layout shows model drawing, never its own neighbours' crops.
+  //
+  // Blank-sheet dropping is opt-in (DROP_BLANK_SHEETS). By default every
+  // selected sheet becomes a PNG: a "blank" heuristic can always be wrong
+  // about a real drawing, and a missing PNG is worse than an empty one.
   const modelEntities = inspected.views.find((view) => view.isModel)?.drawing.entities ?? [];
-  const { renderable, omitted } = partitionRenderable(selected, modelEntities);
+  const { renderable, omitted } = config.dropBlankSheets
+    ? partitionRenderable(selected, modelEntities)
+    : { renderable: selected, omitted: [] as OmittedSheet[] };
   assertWithinBudget(deadline, "filtering blank sheets");
   if (omitted.length > 0) {
     logger.info?.(
@@ -318,15 +364,17 @@ export async function convertDwg(
     assertWithinBudget(deadline, `rendering sheet ${index + 1} of ${renderable.length}`);
     const output = await renderViewPng(view, config, logger);
     assertWithinBudget(deadline, `rasterizing sheet ${index + 1} of ${renderable.length}`);
-    const ink = await rasterInkFraction(output.png);
-    if (ink < config.blankSheetInkFraction) {
-      omitted.push({ name: view.name, reason: "too-little-detail" });
-      logger.info?.(
-        `Sheet "${view.name}" rendered ${(ink * 100).toFixed(2)}% ink (under ${(
-          config.blankSheetInkFraction * 100
-        ).toFixed(2)}%); too little detail to be worth a PNG, omitted.`
-      );
-      continue;
+    if (config.dropBlankSheets) {
+      const ink = await rasterInkFraction(output.png);
+      if (ink < config.blankSheetInkFraction) {
+        omitted.push({ name: view.name, reason: "too-little-detail" });
+        logger.info?.(
+          `Sheet "${view.name}" rendered ${(ink * 100).toFixed(2)}% ink (under ${(
+            config.blankSheetInkFraction * 100
+          ).toFixed(2)}%); too little detail to be worth a PNG, omitted.`
+        );
+        continue;
+      }
     }
     sheets.push({
       ...output,

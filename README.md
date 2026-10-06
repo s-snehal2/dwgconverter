@@ -11,7 +11,7 @@ so nothing is ever sent to a third party.
 
 ## How it works
 
-The pipeline is deliberately modular so each stage is unit-testable:
+The pipeline is deliberately modular so each stage does one thing:
 
 ```
 Browser ─► POST /api/convert ─► reader  (acad-ts:  DWG  → normalized model)
@@ -53,14 +53,15 @@ the rasterization from the DWG parser and keeps the renderer fully ours.
 
 ### Supported files & entities (MVP)
 
-- DWG versions **R14 (AC1014)** through **AC1032** (AutoCAD 2018).
-- **Single-sheet DWGs only.** A DWG with more paper-space layouts than
-  `MAX_LAYOUTS` (default 1) is rejected with a clear "multiple layouts"
-  message instead of being converted — no sheet picker, one PNG per upload.
+- DWG versions **R13 (AC1012)** through **AC1032** (AutoCAD 2018 and later),
+  as supported by the parser.
+- **Multi-sheet DWGs.** Every paper-space layout becomes its own PNG (plus
+  model-space crops); a DWG with more layouts than `MAX_LAYOUTS` (default 100)
+  is rejected with a clear "multiple layouts" message.
 - Modelspace entities: **LINE, CIRCLE, ARC, LWPOLYLINE/POLYLINE/2D/3D,
   POINT, ELLIPSE, TEXT, MTEXT**, and **INSERT** (expanded to their block's
   entities, capped to avoid runaway recursion).
-- Older pre-R14 DWGs (r1.x–r13) and password-protected files are rejected.
+- Older pre-R13 DWGs (r1.x–r12) and password-protected files are rejected.
 - Other entity types (HATCH, SPLINE, SOLID, dimension objects, …) are skipped
   with a warning rather than failing.
 
@@ -87,23 +88,35 @@ Every value has a safe default, so you only need to change what matters to you:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TEMP_DIR` | `./temp` | Directory for staged uploads/outputs |
-| `MAX_FILE_SIZE_MB` | `50` | Maximum upload size |
-| `MAX_LAYOUTS` | `1` | Maximum paper-space layouts accepted; more single-sheet rejections |
-| `MAX_PNG_DIMENSION` | `3000` | Max output width/height in px |
+| `TEMP_DIR` | `./temp` | Directory for outputs/cache. Ignored when Supabase is configured |
+| `SUPABASE_URL` | *(empty)* | Supabase project URL; enables bucket-backed storage when set |
+| `SUPABASE_SERVICE_ROLE_KEY` | *(empty)* | Server-only Supabase key (`sb_secret_...`); never sent to the browser |
+| `SUPABASE_STORAGE_BUCKET` | `dwg-files` | Private bucket holding outputs, AI images and the AI cache |
+| `MAX_FILE_SIZE_MB` | `80` | Maximum DWG size the convert route accepts. The platform's request-body cap (~4.5 MB) bites first, since direct upload is removed |
+| `MAX_LAYOUTS` | `100` | Max sheets converted per DWG; more layouts are rejected |
+| `DROP_BLANK_SHEETS` | *(unset)* | Set to `true` to drop sheets showing no drawing; default keeps every sheet as a PNG |
+| `MAX_PNG_DIMENSION` | `4500` | Max output width/height in px for paper-space layout sheets |
+| `MODEL_PNG_DIMENSION` | *(falls back to `MAX_PNG_DIMENSION`)* | Max output width/height in px for model-space crops only. A crop frames the whole drawing, so its labels are sub-pixel and benefit from extra resolution |
+| `MIN_TEXT_CAP_PX` | `4` | Legibility floor for label cap height in px. Labels draw at `max(true size, this)`; on a large drawing a true-size label is sub-pixel and would be invisible |
+| `MAX_TEXT_CAP_PX` | `48` | Ceiling for label cap height in px. With `STRICT_TEXT_SCALE` on there is no legibility floor, so one mis-scaled entity height otherwise renders as type larger than the sheet |
 | `MARGIN_PX` | `50` | Padding around the drawing, in px |
-| `CLEANUP_AGE_MINUTES` | `43200` | Age after which converted outputs are swept (default 30 days); results stay downloadable for that window, storage grows with conversion volume |
+| `CLEANUP_AGE_MINUTES` | `43200` | Age after which converted outputs are swept (default 30 days). Covers **both** the converted sheet PNGs (`outputs/{id}.png`) and the generated AI images (`outputs/{id}.ai.png`), so either can be downloaded for 30 days from the moment of conversion |
 | `CACHE_AGE_MINUTES` | `43200` | AI-image cache retention (default 30 days): re-uploading the same drawing reuses its earlier generated image instead of calling Gemini |
+| `UPLOAD_AGE_MINUTES` | `60` | Age after which a staged inbound DWG is swept; normally deleted as soon as its conversion finishes |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Per-IP convert requests/minute |
-| `COLOR_MODE` | *(unset)* | Set to `color` for colored (layer-based) output; default is monochrome |
+| `COLOR_MODE` | unset | Monochrome (unset) draws black line work and black labels, with substantial filled regions in light grey so highlights still read as highlights. Set to `color` for colored (layer-based) output |
 | `GEMINI_API_KEY` | *(empty)* | Google AI API key; when set, enables AI image generation via Gemini 3.1 Flash (Nano Banana 2) |
 | `GEMINI_MODEL` | `gemini-3.1-flash-image` | Gemini model id used for AI image generation |
-| `GEMINI_PROMPT` | *(built-in)* | Static prompt sent to Gemini for architectural visualization; see `src/server/config.ts` for the default |
-| `AI_GENERATION_LIMIT` | `3` | Max AI image generations per converted drawing; cache hits do not consume a generation |
+| `GEMINI_PROMPT` | *(built-in)* | Prompt sent to Gemini verbatim for architectural visualization; see `src/server/config.ts` for the default |
+| `AI_GENERATION_LIMIT` | `3` | Max AI image generations per conversion; `0` means unlimited — reuse is decided by the 30-day AI pair cache instead |
+| `STRICT_TEXT_SCALE` | `true` | Draw labels at their true DWG size; set to `false` to enforce the `MIN_TEXT_CAP_PX` legibility floor instead |
 
 > Note: `GEMINI_PROMPT` is optional. Leaving it empty uses the built-in
 > architectural-visualization prompt, so you never need to paste the full text
-> in.
+> in. It is sent to Gemini exactly as written, together with the selected sheet
+> PNG and nothing else — no extracted drawing text, no per-request prompt — so a
+> repeat of the same request within 30 days is served from `ai-outputs/` in
+> Supabase without a Gemini call.
 
 **Where the env file goes:** edit `frontend/.env` (Next.js auto-loads it from
 the `frontend/` directory).
@@ -117,37 +130,34 @@ times (no deletion on download) and temp files are swept after
 ### Reusing generated images (AI cache)
 
 When a user converts a drawing they've converted before and clicks **Generate AI
-image**, the app does not call Gemini again. The converted PNG is hashed
-(SHA-256) and looked up in a cache; a hit replays the earlier generated image
-instantly (response includes `cached: true`, and it does not consume a
-generation). Cached images live under a separate `cache/` namespace and expire
-after `CACHE_AGE_MINUTES` (default 30 days). Storage grows with the number of
-*unique* drawings seen within that window (~1–2 MB each), so on Vercel's free
-Blob allowance keep the volume of unique drawings moderate or lower
-`CACHE_AGE_MINUTES`.
+image**, the app does not call Gemini again. The request identity (sheet,
+prompt, PNG bytes) is hashed into an `aiPairId` and looked up; a hit replays the
+earlier generated image instantly (response includes `cached: true`, and it does
+not consume a generation). The key excludes the per-upload conversion id, so
+re-uploading the same DWG resolves to the same entry. Only the generated image is
+stored, under `ai-outputs/` in the private Supabase Storage bucket, and it
+expires after `CACHE_AGE_MINUTES` (default 30 days). Without Supabase there is
+no bucket, so the cache is skipped and a miss simply costs a Gemini call.
+Storage grows with the number of *unique* drawings seen within that window
+(~1–2 MB each).
 
-### Keeping Vercel Blob under its free limit
+### Keeping storage under control
 
-On Vercel the converted PNGs, AI images, the AI-image cache and sidecars are
-stored in Vercel Blob (switched on when `BLOB_READ_WRITE_TOKEN`/`BLOB_STORE_ID`
-is set). Outputs expire once they are older than
-`CLEANUP_AGE_MINUTES`; a throttled sweep runs opportunistically on
+Converted PNGs, AI images, and their sidecars live in a private Supabase Storage
+bucket when credentials are present. Without them, the app falls back to
+`TEMP_DIR` on disk (and skips the AI cache). Objects in `outputs/` expire after
+`CLEANUP_AGE_MINUTES`; `ai-outputs/` entries expire after `CACHE_AGE_MINUTES`;
+uploads are deleted immediately after conversion but have a short
+`UPLOAD_AGE_MINUTES` cap to catch crashes. The throttled sweep runs opportunistically on
 `/api/convert`, `/api/generate`, `/api/download` and `/api/download-ai`, plus a
 guaranteed daily pass from the Vercel Cron job in `vercel.json` that also ages
-out cached AI images older than `CACHE_AGE_MINUTES`.
+out cached images. `CRON_SECRET` must be set on Vercel for the cron to pass.
 
-So old outputs are removed proactively, not only by coincidence:
-
-1. **One-off purge** (reclaim space immediately, e.g. after hitting 100%):
-   from `frontend/`, run
-   `$env:BLOB_READ_WRITE_TOKEN = "<token>"` then
-   `node scripts/cleanup-blobs.mjs` (add `--older-than-minutes 43200` or `--all`
-   to widen the net — see the script header).
-2. **Daily cron** — deploy the app to **production**; on Hobby the `0 4 * * *`
-   job runs once per day within the 04:00–04:59 UTC window. Set a
-   `CRON_SECRET` environment variable on Vercel (≥16 random chars); the cron
-   calls `/api/cleanup` with it as a bearer token and anything else gets a 401.
-   Note that schedules more frequent than daily fail to deploy on Hobby.
+1. **Daily cron** — deploy the app to **production**; on Hobby the `0 4 * * *`
+   job runs once per day. Set a `CRON_SECRET` environment variable on Vercel;
+   the cron calls `/api/cleanup` with it as a bearer token and anything else
+   gets a 401. That endpoint is the only cleanup entrypoint — it sweeps every
+   group in one pass, including the AI pair cache.
 
 ## Run it
 
@@ -170,9 +180,11 @@ npm run dev              # development server with hot reload
 
 Then open `http://localhost:3000`.
 
-Temporary uploads/outputs go to `frontend/temp/` by default (`TEMP_DIR=./temp`),
-and the same API endpoints are used (`/api/convert`, `/api/generate/[id]`,
-`/api/download/[id]`, `/api/download-ai/[id]`).
+Outputs (and, with Supabase unset, the AI cache) go to `frontend/temp/` by
+default (`TEMP_DIR=./temp`); with Supabase credentials present they go to the
+bucket instead. The same API endpoints are used (`/api/upload`,
+`/api/convert`, `/api/generate/[id]`, `/api/download/[id]`,
+`/api/download-ai/[id]`).
 
 ## Project structure
 
@@ -187,7 +199,8 @@ dwg2png/
         ├── app/
         │   ├── page.tsx                     # the conversion screen
         │   ├── api/convert/route.ts         # POST: DWG → PNG + conversionId
-        │   ├── api/cleanup/route.ts         # GET: Vercel Cron sweep of expired outputs
+        │   ├── api/upload/route.ts            # 404 tombstone (direct uploads removed)
+        │   ├── api/cleanup/route.ts           # GET: Vercel Cron sweep of expired objects
         │   ├── api/generate/[id]/route.ts   # POST: DWG PNG → AI photorealistic image (Gemini)
         │   ├── api/download/[id]/route.ts   # GET: one-shot PNG download
         │   └── api/download-ai/[id]/route.ts # GET: Gemini AI image download
@@ -201,7 +214,10 @@ dwg2png/
             │                    #   entityExtractor, boundsCalculator,
             │                    #   coordinateMapper, renderer, pngGenerator,
             │                    #   convertDwg (orchestrator), fileCleanup,
-            │                    #   geminiImage (AI image generation, Gemini)
+            │                    #   geminiImage (AI image generation, Gemini),
+            │                    #   supabaseStore (bucket adapter),
+            │                    #   outputStore (outputs), uploadStore (staged uploads),
+            │                    #   aiPairCache (AI image reuse)
             ├── models/          # normalized Drawing / Entity / Bounds /
             │                    #   Layer / Block
             └── utils/           # geometry, errors, fileValidation, lineWeight,

@@ -2,7 +2,7 @@ import { entityBounds } from "./boundsCalculator";
 import { modelToPagePoint } from "./viewportMapper";
 import type { OmittedSheet } from "../../types/conversion";
 import type { Entity } from "../models/entity";
-import type { PageViewport } from "../models/page";
+import { isUsableViewHeight, type PageViewport } from "../models/page";
 import type { InspectedView } from "./convertDwg";
 
 /**
@@ -66,7 +66,7 @@ function modelWindowFor(vp: PageViewport): {
   maxX: number;
   maxY: number;
 } {
-  const scale = vp.viewHeight === 0 || !Number.isFinite(vp.viewHeight) ? 1 : vp.height / vp.viewHeight;
+  const scale = isUsableViewHeight(vp.viewHeight) ? vp.height / vp.viewHeight : 1;
   // Model units spanned by the viewport rect on the page.
   const spanX = vp.width / scale;
   const spanY = vp.height / scale;
@@ -124,7 +124,6 @@ function viewportShowsDrawing(vp: PageViewport, modelEntities: Entity[]): boolea
   const pageRect = { minX: vp.minX, minY: vp.minY, maxX: vp.maxX, maxY: vp.maxY };
   for (const entity of modelEntities) {
     if (!isDrawingEntity(entity)) continue;
-    // A layer frozen in this viewport renders as nothing (see PageViewport).
     if (frozen.has(entity.layer)) continue;
     if (!overlaps(entityBounds(entity), window)) continue;
     if (overlaps(projectedBoundsInPage(entity, vp), pageRect)) return true;

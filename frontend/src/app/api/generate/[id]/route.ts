@@ -1,58 +1,80 @@
 import type { NextRequest } from "next/server";
 import { getConfig } from "@/server/config";
-import { generateDrawingImage } from "@/server/services/geminiImage";
+import { computeAiPairId, promptHash, readAiPair, saveAiPair } from "@/server/services/aiPairCache";
+import { composeAiPrompt, generateDrawingImage } from "@/server/services/geminiImage";
 import {
-  sweepExpiredOutputsThrottled,
-  readOutput,
-  saveAiOutput,
-  saveCacheAiImage,
-  readCacheAiImage,
+  claimAiGeneration,
   getAiGenerationCount,
   incrementAiGenerationCount,
+  readOutput,
+  readOutputSourceMeta,
+  releaseAiGenerationClaim,
+  saveAiOutput,
+  sweepExpiredOutputsThrottled,
 } from "@/server/services/outputStore";
-import { toAppError, AppError, userMessageForCode, httpStatusForCode, type ErrorCode } from "@/server/utils/errors";
-import { isSafeConversionId } from "@/server/utils/storage";
+import { toAppError, userMessageForCode, httpStatusForCode, type ErrorCode } from "@/server/utils/errors";
 import { sha256Hex } from "@/server/utils/hash";
-import { takeRateLimit } from "@/server/utils/rateLimit";
+import { clientIpFrom, takeRateLimit } from "@/server/utils/rateLimit";
+import { isSafeConversionId } from "@/server/utils/storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
-
-function clientIp(request: NextRequest): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    return forwarded.split(",")[0]?.trim() ?? "unknown";
-  }
-  return request.headers.get("x-real-ip") ?? "local";
-}
 
 function log(message: string): void {
   console.info(`[generate] ${message}`);
 }
 
-/** User-supplied prompt from the JSON request body, validated + truncated. */
-async function readUserPrompt(request: NextRequest, maxChars: number): Promise<string | undefined> {
-  if (request.headers.get("content-type")?.includes("application/json")) {
-    const body = (await request.json().catch(() => null)) as { prompt?: unknown } | null;
-    const raw = typeof body?.prompt === "string" ? body.prompt : "";
-    const trimmed = raw.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    if (trimmed.length > maxChars) {
-      throw new AppError("INVALID_PROMPT", "The AI prompt is too long.");
-    }
-    return trimmed;
+/**
+ * Run a store call, turning a storage failure into a `STORAGE_UNAVAILABLE`
+ * response instead of letting it escape the handler as an unhandled 500 with no
+ * error envelope. Returns null on failure.
+ */
+async function storageCall<T>(fn: () => Promise<T>, what: string): Promise<T | null> {
+  try {
+    return await fn();
+  } catch (err) {
+    log(`${what} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
   }
-  return undefined;
+}
+
+interface GenerateRequestBody {
+  regenerate: boolean;
+}
+
+/**
+ * Parse the JSON request body once.
+ *
+ * `request.json()` consumes the body, so everything the handler needs from it
+ * has to be read in a single pass. A `prompt` field is accepted and ignored:
+ * the prompt is fixed by `GEMINI_PROMPT`, so a per-request one would change the
+ * cache key without changing what the model receives.
+ */
+async function readGenerateBody(request: NextRequest): Promise<GenerateRequestBody> {
+  if (!request.headers.get("content-type")?.includes("application/json")) {
+    return { regenerate: false };
+  }
+  const body = (await request.json().catch(() => null)) as {
+    prompt?: unknown;
+    regenerate?: unknown;
+  } | null;
+  return {
+    // Only a literal `true` opts out of the cache; anything else is a plain
+    // cache-first request, which is what keeps a re-upload free.
+    regenerate: body?.regenerate === true,
+  };
 }
 
 /**
  * POST /api/generate/:id
- * Reads the already-converted DWG sheet PNG and sends it to Gemini Nano
- * Banana 2 with the architectural-visualization base prompt, optionally
- * steered by a user-supplied `prompt` in the JSON body. Stores the generated
- * AI image as outputs/{id}.ai.png.
+ * Reads the already-converted DWG sheet PNG and sends it to Gemini with the
+ * fixed architectural-visualization prompt, storing the result as
+ * outputs/{id}.ai.png.
+ *
+ * The AI pair cache is consulted first: the same sheet, prompt and PNG bytes
+ * within the retention window replay the earlier image for free, and only an
+ * explicit `regenerate: true` spends a generation. A drawing may be generated
+ * up to AI_GENERATION_LIMIT times per conversion (3 by default, 0 = unlimited).
  */
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -68,9 +90,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     return errorResponse("AI_NOT_CONFIGURED");
   }
 
-  let userPrompt: string | undefined;
+  let body: GenerateRequestBody;
   try {
-    userPrompt = await readUserPrompt(request, config.maxAiPromptChars);
+    body = await readGenerateBody(request);
   } catch (err) {
     const appError = toAppError(err);
     return Response.json(
@@ -79,7 +101,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     );
   }
 
-  if (!takeRateLimit(clientIp(request), config.rateLimitMax, 60_000)) {
+  if (!takeRateLimit(clientIpFrom(request.headers), config.rateLimitMax, 60_000)) {
     return errorResponse("RATE_LIMITED");
   }
 
@@ -104,62 +126,108 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     log(`Cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  const usedSoFar = await getAiGenerationCount(id);
-  if (usedSoFar >= config.aiGenerationLimit) {
-    log(`Generate limit reached for ${id} (${usedSoFar}/${config.aiGenerationLimit}).`);
-    return limitResponse(config.aiGenerationLimit);
-  }
-
   const baseName = stored.fileName.replace(/\.png$/i, "");
   const png = stored.buffer;
 
-  const hash = sha256Hex(png);
-  let cached: Awaited<ReturnType<typeof readCacheAiImage>> = null;
-  try {
-    cached = await readCacheAiImage(hash);
-  } catch (err) {
-    // A failed cache *lookup* should never block generation.
-    log(`Cache lookup failed, generating fresh: ${err instanceof Error ? err.message : String(err)}`);
+  // Prefer the identity written at convert time; fall back to hashing for
+  // conversions stored before the `.meta` sidecar existed. Such a fallback
+  // loses cross-upload cache reuse (the sheet id becomes the per-upload id),
+  // which is the price of not re-hashing multi-megabyte PNGs for new uploads.
+  const meta = await storageCall(() => readOutputSourceMeta(id), "Failed to read the output identity");
+  if (!meta) {
+    log(`No stored identity for ${id}; hashed the PNG instead.`);
+  }
+  const pngHash = meta?.pngHash || sha256Hex(png);
+  const sheetId = meta?.sheetId || id;
+  const viewName = meta?.viewName || "";
+  const sourceHash = meta?.sourceHash || "";
+  const basePromptHash = promptHash(composeAiPrompt(config));
+
+  const aiPairId = computeAiPairId({ sheetId, viewName, promptHash: basePromptHash, pngHash });
+
+  // Cache-first, and always before the allowance is charged: a re-requested
+  // drawing still succeeds after the limit is reached. `regenerate` is the only
+  // way past a live pair.
+  if (!body.regenerate) {
+    const pair = await storageCall(() => readAiPair(aiPairId), "Failed to read the AI pair cache");
+    if (pair) {
+      const fileName = pair.meta.fileName || `${baseName}-ai.png`;
+      // Failure to persist the replayed copy surfaces as an error rather than
+      // leaving the download route with nothing to serve.
+      try {
+        await saveAiOutput(id, pair.output, fileName);
+      } catch (err) {
+        log(`Storing the cached AI image failed: ${err instanceof Error ? err.message : String(err)}.`);
+        return errorResponse("STORAGE_UNAVAILABLE");
+      }
+      const generationsUsed =
+        (await storageCall(() => getAiGenerationCount(id), "Failed to read the generation count")) ?? 0;
+      log(
+        `Cache hit for ${aiPairId}: reusing an earlier AI image (${pair.output.byteLength} bytes) without calling Gemini.`
+      );
+      return Response.json(
+        {
+          success: true,
+          conversionId: id,
+          fileName,
+          size: pair.output.byteLength,
+          durationMs: 0,
+          generationsUsed,
+          generationsLimit: config.aiGenerationLimit,
+          cached: true,
+          source: "cached-pair",
+          blocked: true,
+          sourceHash: sourceHash || undefined,
+        },
+        { status: 200 },
+      );
+    }
   }
 
-  if (cached) {
-    const fileName = cached.fileName || `${baseName}-ai.png`;
-    // Failure to persist the cached copy surfaces as an error rather than
-    // silently paying for a second Gemini call.
-    await saveAiOutput(id, cached.buffer, fileName);
-    log(
-      `Cache hit for ${hash}: reusing earlier AI image (${cached.buffer.byteLength} bytes) without calling Gemini.`
-    );
-    return Response.json(
-      {
-        success: true,
-        conversionId: id,
-        fileName,
-        size: cached.buffer.byteLength,
-        durationMs: 0,
-        generationsUsed: usedSoFar,
-        generationsLimit: config.aiGenerationLimit,
-        cached: true,
-      },
-      { status: 200 },
-    );
+  // Claim the budget before the (up to 240s) Gemini call: checking the count
+  // and incrementing afterwards would let two concurrent requests both see a
+  // slot free and both spend one, so the pair is serialized per conversion.
+  const limit = config.aiGenerationLimit;
+  let claimed: Awaited<ReturnType<typeof claimAiGeneration>> | null = null;
+  if (limit > 0) {
+    const claim = await storageCall(() => claimAiGeneration(id, limit), "Failed to claim an AI generation slot");
+    if (claim === null) {
+      return errorResponse("STORAGE_UNAVAILABLE");
+    }
+    if (!claim.claimed) {
+      log(`Generate limit reached for ${id} (${claim.generationsUsed}/${limit}).`);
+      return limitResponse(limit);
+    }
+    claimed = claim;
   }
 
   try {
     log(`Sending ${id}.png (${png.byteLength} bytes) to Gemini for AI generation.`);
 
-    const { image, durationMs } = await generateDrawingImage(png, config, userPrompt);
+    const { image, durationMs } = await generateDrawingImage(png, config);
     log(`Gemini returned AI image (${image.byteLength} bytes) in ${durationMs}ms.`);
 
     const fileName = `${baseName}-ai.png`;
     await saveAiOutput(id, image, fileName);
-    const generationsUsed = await incrementAiGenerationCount(id);
+
+    // Filing the pair is best-effort: losing it only costs a redundant Gemini
+    // call on the next request, and must not fail a generation that already
+    // succeeded and was stored.
     try {
-      await saveCacheAiImage(hash, image, fileName);
+      await saveAiPair({ aiPairId, sheetId, viewName, promptHash: basePromptHash, pngHash, fileName }, image);
     } catch (cacheErr) {
-      log(`Cache write failed (non-fatal): ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}`);
+      log(`AI pair write failed (non-fatal): ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}`);
     }
-    log(`AI image written to ${id}.ai.png (generation ${generationsUsed}/${config.aiGenerationLimit}).`);
+
+    let generationsUsed: number;
+    if (claimed) {
+      generationsUsed = claimed.generationsUsed;
+    } else {
+      // Unlimited mode keeps the counter for display but enforces nothing.
+      generationsUsed =
+        (await storageCall(() => incrementAiGenerationCount(id), "Failed to record the AI generation")) ?? 0;
+    }
+    log(`AI image written to ${id}.ai.png (generation ${generationsUsed}/${limit || "unlimited"}).`);
 
     return Response.json(
       {
@@ -169,11 +237,27 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         size: image.byteLength,
         durationMs,
         generationsUsed,
-        generationsLimit: config.aiGenerationLimit,
+        generationsLimit: limit,
+        cached: false,
+        source: "generated",
+        blocked: false,
+        regenerate: body.regenerate,
+        sourceHash: sourceHash || undefined,
       },
       { status: 200 },
     );
   } catch (err) {
+    // The slot was claimed before Gemini ran, so hand it back: the counter
+    // tracks generations that actually produced an image, not attempts.
+    if (claimed) {
+      const released = await storageCall(
+        () => releaseAiGenerationClaim(id),
+        "Failed to release the claimed AI generation slot"
+      );
+      if (released === null) {
+        log(`The generation counter may be inflated for ${id}: the claim could not be released.`);
+      }
+    }
     const appError = toAppError(err);
     const code =
       appError.code === "INTERNAL_ERROR" || appError.code === "PARSER_ERROR"

@@ -8,6 +8,7 @@ import {
   normalizeAngle,
   sweepContains,
 } from "../utils/geometry";
+import { textEntityBounds } from "./textMetrics";
 
 /**
  * Axis-aligned bounds of a single normalized entity. Every bounds
@@ -75,14 +76,10 @@ export function entityBounds(entity: Entity): Bounds {
       return result;
     }
     case "TEXT":
-    case "MTEXT": {
-      const p = entity.position;
-      const height = entity.height > 0 ? entity.height : 1;
-      const width = entity.type === "MTEXT" && entity.width > 0
-        ? entity.width
-        : entity.text.length * height * 0.55;
-      return rect(p.x, p.y, p.x + width, p.y + height);
-    }
+    case "MTEXT":
+      // Shared with the renderer's viewport culler so page fit and entity
+      // culling can never disagree about how much room a label occupies.
+      return textEntityBounds(entity);
     case "SOLID": {
       let minX = Infinity;
       let minY = Infinity;

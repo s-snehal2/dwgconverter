@@ -2,9 +2,11 @@ import { readdirSync, statSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Automatic cleanup of temporary files. Directories are swept for files whose
- * modification time is older than the configured age. Best-effort: failures
- * deleting a single file never break the request.
+ * Automatic cleanup of temporary files. Directories are swept recursively for
+ * files whose modification time is older than the configured age, so anything
+ * nested one level down is reclaimed rather than leaked. Emptied subdirectories
+ * are pruned. Best-effort: failures deleting a single file never break the
+ * request.
  */
 export function sweepDirectory(dir: string, olderThanMs: number): number {
   const now = Date.now();
@@ -19,7 +21,16 @@ export function sweepDirectory(dir: string, olderThanMs: number): number {
     const full = join(dir, entry);
     try {
       const stats = statSync(full);
-      if (stats.isFile() && now - stats.mtimeMs > olderThanMs) {
+      if (stats.isDirectory()) {
+        removed += sweepDirectory(full, olderThanMs);
+        try {
+          if (readdirSync(full).length === 0) {
+            rmSync(full, { recursive: true, force: true });
+          }
+        } catch {
+          // Leave the directory in place.
+        }
+      } else if (stats.isFile() && now - stats.mtimeMs > olderThanMs) {
         rmSync(full, { force: true });
         removed += 1;
       }

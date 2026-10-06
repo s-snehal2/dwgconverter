@@ -55,6 +55,14 @@ export interface ConversionError {
   error: string;
 }
 
+/**
+ * Where the returned AI image came from:
+ * - `generated`: Gemini produced a fresh image for this request.
+ * - `cached-pair`: an earlier image for the same sheet, prompt and PNG bytes,
+ *   replayed from the AI pair cache without a Gemini call.
+ */
+export type AiImageSource = "generated" | "cached-pair";
+
 export interface AiImageResult {
   success: boolean;
   conversionId: string;
@@ -65,6 +73,24 @@ export interface AiImageResult {
   generationsUsed: number;
   /** Maximum AI generations allowed per conversion. */
   generationsLimit: number;
+  /**
+   * True when the server replayed an earlier image from the AI pair cache
+   * instead of calling Gemini. Such a replay consumes no generation and reports
+   * `durationMs: 0`.
+   */
+  cached?: boolean;
+  source?: AiImageSource;
+  /**
+   * True when the served image came from the pair cache. The drawing already has
+   * an AI image for 30 days, so the UI must stop offering further generations
+   * rather than spending another one.
+   */
+  blocked?: boolean;
+  createdAt?: number;
+  /** Echoed back when this request was an explicit regeneration. */
+  regenerate?: boolean;
+  /** sha256 of the source DWG this drawing belongs to. */
+  sourceHash?: string;
 }
 
 export interface TilesviewResult {

@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { getConfig } from "@/server/config";
-import { sweepExpiredOutputs, sweepExpiredCache } from "@/server/services/outputStore";
+import { sweepExpiredOutputs } from "@/server/services/outputStore";
+import { sweepExpiredAiPairs } from "@/server/services/aiPairCache";
 
 export const runtime = "nodejs";
 
@@ -19,9 +20,12 @@ function isCronAuthorized(request: NextRequest): boolean {
 /**
  * GET /api/cleanup
  *
- * Daily Vercel Cron target. Sweeps outputs older than CLEANUP_AGE_MINUTES so
- * Vercel Blob (or disk temp dirs) never fill up. Only ever runs when Vercel
- * invokes it with the CRON_SECRET bearer token; everyone else gets a 401.
+ * Daily Vercel Cron target, and the single cleanup entrypoint for the project.
+ * Sweeps the Supabase Storage bucket (or disk temp dirs) so it never fills up:
+ * `outputs/` on the CLEANUP_AGE_MINUTES clock, cached AI images on their own
+ * 30-day `expiresAt`, plus any `uploads/` orphaned by a crashed conversion on the
+ * shorter UPLOAD_AGE_MINUTES clock. Only ever runs when Vercel invokes it with
+ * the CRON_SECRET bearer token; everyone else gets a 401.
  */
 export async function GET(request: NextRequest) {
   if (!isCronAuthorized(request)) {
@@ -31,12 +35,12 @@ export async function GET(request: NextRequest) {
 
   const config = getConfig();
   try {
-    const removed = await sweepExpiredOutputs(config.cleanupAgeMs);
-    const cacheRemoved = await sweepExpiredCache(config.cacheAgeMs);
-    log(
-      `Cleaned up ${removed} expired output(s) and ${cacheRemoved} cached image(s).`
-    );
-    return Response.json({ success: true, removed, cacheRemoved }, { status: 200 });
+    const removed = await sweepExpiredOutputs(config.cleanupAgeMs, config.uploadAgeMs);
+    // Cached AI images expire on their own recorded `expiresAt` rather than on a
+    // storage timestamp, so a pair rewritten mid-window is not culled early.
+    const aiRemoved = await sweepExpiredAiPairs();
+    log(`Cleaned up ${removed} expired output(s) and ${aiRemoved} cached AI image object(s).`);
+    return Response.json({ success: true, removed, aiRemoved }, { status: 200 });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Cleanup failed: ${message}`);

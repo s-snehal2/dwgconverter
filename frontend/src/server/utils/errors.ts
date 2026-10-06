@@ -4,7 +4,6 @@
  */
 export type ErrorCode =
   | "INVALID_FILE"
-  | "INVALID_PROMPT"
   | "UNSUPPORTED_EXTENSION"
   | "FILE_TOO_LARGE"
   | "CONVERSION_TIMEOUT"
@@ -37,7 +36,6 @@ export class AppError extends Error {
 
 const USER_MESSAGES: Record<ErrorCode, string> = {
   INVALID_FILE: "The uploaded file could not be read.",
-  INVALID_PROMPT: "The AI prompt is too long. Please use a shorter prompt.",
   UNSUPPORTED_EXTENSION: "Only DWG files are supported.",
   FILE_TOO_LARGE: "File size exceeds the allowed limit.",
   CONVERSION_TIMEOUT: "This drawing is too complex to convert in time. Try a smaller file, or split it and convert one part at a time.",
@@ -50,7 +48,7 @@ const USER_MESSAGES: Record<ErrorCode, string> = {
   NO_DRAWABLE_CONTENT: "No drawable content was found in this DWG file.",
   AI_NOT_CONFIGURED: "AI image generation is not configured on this server.",
   AI_GENERATION_ERROR: "The AI image could not be generated. Please try again.",
-  AI_LIMIT_REACHED: "You've reached the maximum number of AI image generations for this drawing. Convert the DWG again to generate more.",
+  AI_LIMIT_REACHED: "You've reached the maximum of {limit} AI generations for this drawing.",
   FILE_NOT_FOUND: "The requested conversion result no longer exists.",
   DOWNLOAD_ERROR: "The PNG could not be downloaded.",
   RATE_LIMITED: "Too many requests. Please try again shortly.",
@@ -66,7 +64,6 @@ export function userMessageForCode(code: ErrorCode): string {
 export function httpStatusForCode(code: ErrorCode): number {
   switch (code) {
     case "INVALID_FILE":
-    case "INVALID_PROMPT":
     case "UNSUPPORTED_EXTENSION":
     case "FILE_TOO_LARGE":
       return 400;
@@ -97,6 +94,43 @@ export function httpStatusForCode(code: ErrorCode): number {
   }
 }
 
+/**
+ * Supabase Storage API error codes we can expect to see on a misconfigured or
+ * unhappy bucket. The storage layer already maps its own failures onto
+ * AppError("STORAGE_UNAVAILABLE"); this is the safety net for anything that
+ * escapes unwrapped.
+ */
+const SUPABASE_STORAGE_ERROR_CODES = new Set([
+  "NoSuchBucket",
+  "NoSuchKey",
+  "NotFound",
+  "BucketNotEmpty",
+  "QuotaExceeded",
+  "PayloadTooLarge",
+  "AccessDenied",
+  "InvalidRequest",
+  "UnexpectedError",
+  "InternalError",
+]);
+
+/**
+ * Distinguish a storage-backend failure from an application bug, so an
+ * unreachable or misconfigured bucket yields a retryable 503 instead of a
+ * generic 500 that looks like our fault.
+ */
+function isStorageBackendError(err: Error): boolean {
+  const code = (err as Error & { code?: unknown }).code;
+  if (typeof code === "string" && SUPABASE_STORAGE_ERROR_CODES.has(code)) {
+    return true;
+  }
+  const lower = err.message.toLowerCase();
+  return (
+    lower.includes("storage is unavailable") ||
+    lower.includes("bucket not found") ||
+    lower.includes("no such bucket")
+  );
+}
+
 /** Convert any thrown value into an AppError without leaking internals. */
 export function toAppError(err: unknown): AppError {
   if (err instanceof AppError) {
@@ -105,15 +139,7 @@ export function toAppError(err: unknown): AppError {
   if (err instanceof Error) {
     const message = err.message;
     const lower = message.toLowerCase();
-    // Storage backends must be distinguishable from app bugs so a suspended
-    // or down store returns a retryable 503 rather than a generic 500.
-    if (
-      err.name === "BlobStoreSuspendedError" ||
-      lower.includes("store has been suspended") ||
-      lower.includes("store is suspended") ||
-      lower.includes("usage_threshold_limits_reached") ||
-      lower.includes("storage is unavailable")
-    ) {
+    if (isStorageBackendError(err)) {
       return new AppError("STORAGE_UNAVAILABLE", message);
     }
     // Rasterization failures must not be misread as "unsupported DWG version",

@@ -10,7 +10,12 @@ import type {
 import type { ProgressStep } from "@/components/ConversionProgress";
 import { convertDwgFile } from "@/services/api";
 
-const MAX_MB = 80;
+/**
+ * Client-side cap for the file picker. The server enforces its own
+ * `MAX_FILE_SIZE_MB` and is the real authority; in practice the platform's
+ * request-body limit (~4.5 MB) bites long before this number does.
+ */
+const FALLBACK_MAX_MB = 80;
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
@@ -24,6 +29,7 @@ export default function Home() {
   const [results, setResults] = useState<ConversionResultData[] | null>(null);
   const [omittedBlankSheets, setOmittedBlankSheets] = useState<OmittedSheet[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const maxMb = FALLBACK_MAX_MB;
   const abortRef = useRef<AbortController | null>(null);
 
   // Async continuations (conversion promise resolution) must not touch React
@@ -62,8 +68,8 @@ export default function Home() {
         setError("Only .dwg files are supported.");
         return;
       }
-      if (candidate.size > MAX_MB * 1024 * 1024) {
-        setError(`File is larger than the ${MAX_MB}MB limit.`);
+      if (candidate.size > maxMb * 1024 * 1024) {
+        setError(`File is larger than the ${maxMb}MB limit.`);
         return;
       }
       cancelInFlight();
@@ -72,7 +78,7 @@ export default function Home() {
       setResults(null);
       setStep("upload");
     },
-    [cancelInFlight]
+    [cancelInFlight, maxMb]
   );
 
   const clearFile = useCallback(() => {
@@ -112,7 +118,6 @@ export default function Home() {
       if (!mountedRef.current) {
         return;
       }
-      setStep("render");
       setResults(converted.sheets);
       setOmittedBlankSheets(converted.omittedBlankSheets ?? []);
       setStep("done");
@@ -155,7 +160,7 @@ export default function Home() {
         error={error}
         results={results}
         omittedBlankSheets={omittedBlankSheets}
-        maxMb={MAX_MB}
+        maxMb={maxMb}
         onFile={selectFile}
         onClear={clearFile}
         onConvert={runConversion}

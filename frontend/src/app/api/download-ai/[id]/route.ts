@@ -50,9 +50,12 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     status: 200,
     headers: {
       "Content-Type": "image/png",
-      "Content-Disposition": `attachment; filename="${safeBase}"`,
+      // `inline` so the preview/lightbox <img> can render these bytes; see the
+      // matching note in /api/download/[id]/route.ts.
+      "Content-Disposition": `inline; filename="${safeBase}"`,
       "Content-Length": String(stored.buffer.byteLength),
       "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }

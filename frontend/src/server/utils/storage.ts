@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { writeFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
-
 const CONVERSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function newConversionId(): string {
@@ -11,10 +10,6 @@ export function newConversionId(): string {
 /** Strict validation of a conversion ID; guards every download/delete path. */
 export function isSafeConversionId(id: string): boolean {
   return CONVERSION_ID_PATTERN.test(id);
-}
-
-export function uploadPath(dir: string, id: string): string {
-  return join(dir, `${id}.dwg`);
 }
 
 export function outputPath(dir: string, id: string): string {
@@ -42,13 +37,5 @@ export function writeBufferFileAtomic(absolutePath: string, buffer: Uint8Array):
     } catch {
       // Best-effort cleanup.
     }
-  }
-}
-
-export function deleteFileIfExists(absolutePath: string): void {
-  try {
-    rmSync(absolutePath, { force: true });
-  } catch {
-    // Best-effort cleanup; a failed delete is non-fatal.
   }
 }

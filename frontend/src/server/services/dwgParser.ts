@@ -1,13 +1,50 @@
 import { Insert, Viewport, Hatch, Dimension, Leader, Wipeout } from "@node-projects/acad-ts";
+import {
+  MLine,
+  XLine,
+  Ray,
+  Tolerance,
+  Mesh,
+  PolygonMesh,
+  PolyfaceMesh,
+  ModelerGeometry,
+  TableEntity,
+  MultiLeader,
+  Ole2Frame,
+  Shape,
+  Wall,
+  UnderlayEntity,
+  AttributeEntity,
+} from "@node-projects/acad-ts";
 import type { BlockRecord, CadDocument, Layout } from "@node-projects/acad-ts";
 import type { RawDwgData } from "./dwgReader";
-import { extractEntity, extractHatch, extractLeader, entityIsVisible, normalizeLayer } from "./entityExtractor";
+import {
+  extractEntity,
+  extractHatch,
+  extractLeader,
+  extractMline,
+  extractInfiniteLine,
+  extractTolerance,
+  extractModelerWires,
+  extractMeshFaces,
+  extractPolygonMeshFaces,
+  extractPolyfaceMeshFaces,
+  extractTableEntities,
+  extractMultiLeader,
+  extractUnderlayFrame,
+  extractOleFrame,
+  extractWallRect,
+  extractShapeMark,
+  entityIsVisible,
+  normalizeLayer,
+} from "./entityExtractor";
 import { drawingBounds } from "./boundsCalculator";
 import type { Drawing } from "../models/drawing";
 import type { Entity } from "../models/entity";
 import type { Block } from "../models/block";
 import type { Layer } from "../models/layer";
 import type { Page, PageViewport } from "../models/page";
+import { isUsableViewHeight } from "../models/page";
 
 export interface ConversionStatistics {
   totalEntities: number;
@@ -47,7 +84,8 @@ const NON_RENDERABLE_NAMES = new Set([
   "BLOCK_HEADER",
   "SEQEND",
   "VERTEX",
-  "ATTRIB",
+  // ATTRIB_DEF is the unvalued placeholder; ATTRIB (the valued instance) is
+  // rendered as TEXT via the TextEntity branch below.
   "ATTRIB_DEF",
   "DIMASSOC",
 ]);
@@ -105,17 +143,97 @@ function pushAll<T>(target: T[], items: T[]): void {
   }
 }
 
-/** Normalize one acad-ts entity (including INSERT expansion) into model entities. */
+/**
+ * Stretch XLINE/RAY unit segments to the sheet they belong to.
+ *
+ * Infinite construction lines arrive from the extractor as unit direction
+ * segments (their true extent is unknowable until every other entity is
+ * parsed). Each is re-centered here to span the union bounds of the finite
+ * geometry: an XLINE crosses the whole drawing through its own point, a RAY
+ * starts at its own point and runs twice the half-diagonal. The direction is
+ * preserved, so repeated calls are idempotent. With no finite geometry at all,
+ * a fixed fallback keeps the line visible instead of a dot.
+ */
+export function resolveInfiniteLines(entities: Entity[]): void {
+  let dirty = false;
+  for (const entity of entities) {
+    if (entity.type === "LINE" && (entity.sourceType === "XLINE" || entity.sourceType === "RAY")) {
+      dirty = true;
+      break;
+    }
+  }
+  if (!dirty) {
+    return;
+  }
+  const finite = entities.filter(
+    (entity) => !(entity.type === "LINE" && (entity.sourceType === "XLINE" || entity.sourceType === "RAY"))
+  );
+  const box = drawingBounds(finite);
+  const diagonal = box ? Math.hypot(box.maxX - box.minX, box.maxY - box.minY) : 0;
+  const half = diagonal > 1e-9 ? diagonal * 0.75 : 100;
+  const cx = box ? (box.minX + box.maxX) / 2 : 0;
+  const cy = box ? (box.minY + box.maxY) / 2 : 0;
+  for (const entity of entities) {
+    if (entity.type !== "LINE" || (entity.sourceType !== "XLINE" && entity.sourceType !== "RAY")) {
+      continue;
+    }
+    const dx = entity.end.x - entity.start.x;
+    const dy = entity.end.y - entity.start.y;
+    const len = Math.hypot(dx, dy);
+    if (!(len > 1e-12)) {
+      continue;
+    }
+    const ux = dx / len;
+    const uy = dy / len;
+    if (entity.sourceType === "RAY") {
+      entity.end = { x: entity.start.x + ux * half * 2, y: entity.start.y + uy * half * 2 };
+      continue;
+    }
+    const t = (cx - entity.start.x) * ux + (cy - entity.start.y) * uy;
+    const mx = entity.start.x + ux * t;
+    const my = entity.start.y + uy * t;
+    entity.start = { x: mx - ux * half, y: my - uy * half };
+    entity.end = { x: mx + ux * half, y: my + uy * half };
+  }
+}
+
+/**
+ * Normalize one acad-ts entity (including INSERT expansion) into model entities.
+ *
+ * `dimensionTextHeight` is forwarded to `extractEntity` and only ever set when
+ * recursing through `expandDimensionBlock`; see that function.
+ */
 function normalizeEntity(
   entity: unknown,
   warnings: WarningCollector,
-  depth = 0
+  depth = 0,
+  dimensionTextHeight?: number
 ): Entity[] {
   if (!entity || typeof (entity as { objectName?: string }).objectName !== "string") {
     warnings.add("Skipped an entity that could not be recognized.");
     return [];
   }
   const acadEntity = entity as Parameters<typeof extractEntity>[0];
+
+  // TableEntity extends Insert, so it must be checked before the INSERT
+  // branch: exploding it as a block yields nothing and the whole schedule
+  // would vanish.
+  if (acadEntity instanceof TableEntity) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const parts = extractTableEntities(acadEntity);
+      if (parts.length > 0) {
+        return parts;
+      }
+      warnings.addUnsupported("TABLE");
+      return [];
+    } catch {
+      warnings.add(`Entity "TABLE" could not be processed and was skipped.`);
+      return [];
+    }
+  }
 
   if (acadEntity instanceof Insert) {
     // Architectural drawings rely on blocks: explode transforms the block
@@ -126,10 +244,19 @@ function normalizeEntity(
     }
     const expanded: Entity[] = [];
     try {
+      const transform = acadEntity.getTransform();
       for (const subEntity of acadEntity.explode()) {
         const subName = subEntity.objectName ?? "";
         if (NON_RENDERABLE_NAMES.has(subName)) {
           continue;
+        }
+        // `Insert.explode()` clones the insert's ATTRIB entities but never runs
+        // them through the block transform, so every block attribute would be
+        // drawn at the block origin instead of the insert point — usually off
+        // the sheet, which reads as missing text. Applying the same transform
+        // here puts attribute text back where the DWG placed it.
+        if (subEntity instanceof AttributeEntity) {
+          subEntity.applyTransform(transform);
         }
         pushAll(expanded, normalizeEntity(subEntity, warnings, depth + 1));
       }
@@ -183,11 +310,240 @@ function normalizeEntity(
     return [];
   }
 
+  if (acadEntity instanceof MLine) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const parts = extractMline(acadEntity);
+      if (parts.length > 0) {
+        return parts;
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof MultiLeader) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const parts = extractMultiLeader(acadEntity);
+      if (parts.length > 0) {
+        return parts;
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof Tolerance) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const parts = extractTolerance(acadEntity);
+      if (parts.length > 0) {
+        return parts;
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof PolyfaceMesh) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      // A null return means the face indices disagree with the vertex list;
+      // fall through to the generic vertex path below rather than inventing
+      // faces.
+      const faces = extractPolyfaceMeshFaces(acadEntity);
+      if (faces) {
+        if (faces.length > 0) {
+          return faces;
+        }
+        warnings.addUnsupported(acadEntity.objectName);
+        return [];
+      }
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof PolygonMesh) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const faces = extractPolygonMeshFaces(acadEntity);
+      if (faces) {
+        if (faces.length > 0) {
+          return faces;
+        }
+        warnings.addUnsupported(acadEntity.objectName);
+        return [];
+      }
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof Mesh) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const parts = extractMeshFaces(acadEntity);
+      if (parts.length > 0) {
+        return parts;
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof ModelerGeometry) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const parts = extractModelerWires(acadEntity);
+      if (parts.length > 0) {
+        return parts;
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof Wall) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const rect = extractWallRect(acadEntity);
+      if (rect) {
+        return [rect];
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof Shape) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const mark = extractShapeMark(acadEntity);
+      if (mark) {
+        warnings.add("A SHAPE glyph has no reconstructible geometry; its insertion point was kept.");
+        return [mark];
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof XLine) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const line = extractInfiniteLine(acadEntity, acadEntity.firstPoint, acadEntity.direction, "XLINE");
+      if (line) {
+        return [line];
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof Ray) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const line = extractInfiniteLine(acadEntity, acadEntity.startPoint, acadEntity.direction, "RAY");
+      if (line) {
+        return [line];
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof Ole2Frame) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const frame = extractOleFrame(acadEntity);
+      if (frame) {
+        return [frame];
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
+  if (acadEntity instanceof UnderlayEntity) {
+    try {
+      if (!entityIsVisible(acadEntity)) {
+        return [];
+      }
+      const frame = extractUnderlayFrame(acadEntity);
+      if (frame) {
+        return [frame];
+      }
+      warnings.addUnsupported(acadEntity.objectName);
+      return [];
+    } catch {
+      warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
+      return [];
+    }
+  }
+
   try {
     if (!entityIsVisible(acadEntity)) {
       return [];
     }
-    const normalized = extractEntity(acadEntity);
+    const normalized = extractEntity(acadEntity, dimensionTextHeight);
     if (normalized) {
       return [normalized];
     }
@@ -196,6 +552,29 @@ function normalizeEntity(
   } catch {
     warnings.add(`Entity "${acadEntity.objectName}" could not be processed and was skipped.`);
     return [];
+  }
+}
+
+/**
+ * The text height this dimension's style asks for, in world units.
+ *
+ * Read straight off the active dimension style (`DIMTXT`), scaled by `DIMSCALE`
+ * the same way `extractLeader` scales the arrow size: the scale factor is what
+ * makes a drawing-wide dimension style legible on a large sheet, so ignoring it
+ * would undo that. Returns undefined when the style cannot be read, which leaves
+ * `textEntityHeight` on its generic default.
+ */
+function dimensionStyleTextHeight(dimension: Dimension): number | undefined {
+  try {
+    const style = dimension.getActiveDimensionStyle();
+    const textHeight = style?.textHeight ?? 0;
+    const scale = style?.scaleFactor ?? 0;
+    const scaled = textHeight * (scale > 0 ? scale : 1);
+    return Number.isFinite(scaled) && scaled > 0 ? scaled : undefined;
+  } catch {
+    // A dimension whose style is missing or malformed is not worth failing over;
+    // the generic text default applies, and the renderer clamps the result.
+    return undefined;
   }
 }
 
@@ -222,9 +601,21 @@ function expandDimensionBlock(dimension: Dimension, warnings: WarningCollector, 
       if (NON_RENDERABLE_NAMES.has(subName) || subName === "POINT") {
         continue;
       }
-      const part = normalizeEntity(subEntity, warnings, depth + 1);
+      // The block's own MTEXT carries the measured value, and its stored height
+      // is sometimes 0 — in which case `textEntityHeight` would otherwise land on
+      // DEFAULT_TEXT_HEIGHT (1), roughly 5.5x a real dimension label. Hand it the
+      // dimension style's height so the fallback stays dimension-sized.
+      const part = normalizeEntity(subEntity, warnings, depth + 1, dimensionStyleTextHeight(dimension));
       if (part.length > 0) {
         renderedAny = true;
+        // Stamp the dimension origin onto everything the block contributed.
+        // It has to be done here, after normalization: the block is flattened
+        // into ordinary LINE / MTEXT / SOLID entities, so by the time this
+        // returns there is no longer a Dimension to ask, and the measured value
+        // in particular arrives looking like any other MTEXT.
+        for (const entity of part) {
+          entity.fromDimension = true;
+        }
         pushAll(expanded, part);
       }
     }
@@ -247,7 +638,7 @@ function pageViewportFromAcad(entity: Viewport): PageViewport | null {
   if (entity.representsPaper) {
     return null;
   }
-  if (entity.width <= 0 || entity.height <= 0 || entity.viewHeight <= 0) {
+  if (entity.width <= 0 || entity.height <= 0 || !isUsableViewHeight(entity.viewHeight)) {
     return null;
   }
   const halfW = entity.width / 2;
@@ -306,6 +697,7 @@ function pageFromBlockRecord(blockRecord: BlockRecord | null, warnings: WarningC
     }
     pushAll(pageEntities, normalizeEntity(entity, warnings));
   }
+  resolveInfiniteLines(pageEntities);
 
   let bounds = drawingBounds(pageEntities);
   for (const viewport of pageViewports) {
@@ -363,6 +755,7 @@ function normalizeModelSpace(document: CadDocument, warnings: WarningCollector):
       pushAll(entities, normalized);
     }
   }
+  resolveInfiniteLines(entities);
   return { entities, total, rendered };
 }
 

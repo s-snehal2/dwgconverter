@@ -52,6 +52,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const customRoomsId = await sendRoomToTilesview(stored.buffer, config);
     const visualizerUrl = `${config.tilesviewVisualizerBaseUrl}/${customRoomsId}/MySpace`;
     log(`AI image for ${id} uploaded to TilesView (room id ${customRoomsId}, visualizer ${visualizerUrl}).`);
+
     return Response.json(
       { success: true, conversionId: id, customRoomsId, visualizerUrl },
       { status: 200 },

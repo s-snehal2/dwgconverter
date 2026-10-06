@@ -43,9 +43,16 @@ export async function GET(_request: NextRequest, { params }: { params: Promise<{
     status: 200,
     headers: {
       "Content-Type": "image/png",
-      "Content-Disposition": `attachment; filename="${safeBase}"`,
+      // `inline`, NOT `attachment`: this same URL is the `src` of the preview
+      // <img> and the lightbox <img>. An `attachment` response cannot be
+      // painted by an <img>, so the browser abandons the image and renders its
+      // alt text instead — which is the filename. The Download button is
+      // unaffected because it fetches the bytes and sets `a.download` itself
+      // rather than navigating to this URL.
+      "Content-Disposition": `inline; filename="${safeBase}"`,
       "Content-Length": String(stored.buffer.byteLength),
       "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }

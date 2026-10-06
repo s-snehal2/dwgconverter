@@ -35,3 +35,22 @@ export interface Page {
   viewports: PageViewport[];
   bounds: Bounds;
 }
+
+/**
+ * Floor for a usable `PageViewport.viewHeight`, in drawing units.
+ *
+ * CAD units span many orders of magnitude, so this sits far below any real
+ * window while still excluding zero, negatives and denormal garbage.
+ */
+export const MIN_VIEW_HEIGHT = 1e-9;
+
+/**
+ * Whether a viewport's model-space window height can produce a usable scale.
+ *
+ * The page scale is `height / viewHeight`, so a vanishingly small or non-finite
+ * denominator would project the entire model to astronomically large pixel
+ * coordinates instead of failing cleanly.
+ */
+export function isUsableViewHeight(viewHeight: number): boolean {
+  return Number.isFinite(viewHeight) && viewHeight > MIN_VIEW_HEIGHT;
+}

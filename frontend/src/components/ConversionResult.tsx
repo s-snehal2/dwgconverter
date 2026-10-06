@@ -8,6 +8,7 @@ import {
   generateAiImage,
   aiDownloadUrl,
   sendToTilesview,
+  type ApiError,
 } from "@/services/api";
 
 import {
@@ -17,9 +18,11 @@ import {
   Loader2,
   MonitorSmartphone,
   MousePointerClick,
+  RefreshCw,
   Sparkles,
 } from "lucide-react";
 import type {
+  AiImageResult,
   BlankSheetReason,
   ConversionResult as ConversionResultData,
   OmittedSheet,
@@ -36,8 +39,38 @@ const OMITTED_REASON_LABEL: Record<BlankSheetReason, string> = {
   "too-little-detail": "too little detail",
 };
 
+/**
+ * Client-side ceiling for the long-running calls. The server already times Gemini
+ * out (GEMINI_TIMEOUT_MS, default 240s) and the platform kills the function at
+ * 300s, but a killed response arrives as an opaque gateway error — without this
+ * the button would stay spinning with no way back short of a reload.
+ */
+const AI_REQUEST_TIMEOUT_MS = 300_000;
+const TILESVIEW_REQUEST_TIMEOUT_MS = 90_000;
+
 function describeOmitted(sheet: OmittedSheet): string {
   return `${sheet.name} (${OMITTED_REASON_LABEL[sheet.reason]})`;
+}
+
+/** Per-sheet AI state: the image, its budget, and whether the cache has locked it. */
+interface SheetAiState {
+  /** An AI image exists for this sheet, so it can be previewed and sent. */
+  hasImage: boolean;
+  used?: number;
+  limit?: number;
+  /** This image came from the pair cache and must not be regenerated. */
+  blocked: boolean;
+}
+
+const EMPTY_AI_STATE: SheetAiState = { hasImage: false, blocked: false };
+
+/**
+ * "(used/limit)" tally for the generate buttons. A limit of 0 means unlimited,
+ * so the bare count is shown and the tally never reads as "0 allowed".
+ */
+function generationTally(state: SheetAiState): string {
+  if (state.used === undefined) return "";
+  return state.limit ? ` (${state.used}/${state.limit})` : ` (${state.used})`;
 }
 
 interface ConversionResultProps {
@@ -48,15 +81,20 @@ interface ConversionResultProps {
 
 export default function ConversionResult({ results, omittedBlankSheets = [], onReset }: ConversionResultProps) {
   const [selectedId, setSelectedId] = useState<string | null>(results[0]?.conversionId ?? null);
+  const [aiById, setAiById] = useState<Record<string, SheetAiState>>({});
   const [generating, setGenerating] = useState(false);
-  const [downloadingAi, setDownloadingAi] = useState(false);
   const [sendingToTilesview, setSendingToTilesview] = useState(false);
-  const [generatedAi, setGeneratedAi] = useState<Record<string, boolean>>({});
-  const [aiUsageById, setAiUsageById] = useState<Record<string, { used: number; limit: number }>>({});
+  const [downloadingAi, setDownloadingAi] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<{ kind: "png" | "ai"; id: string } | null>(null);
 
   const selected = results.find((result) => result.conversionId === selectedId) ?? results[0] ?? null;
+  const selectedAi = selected ? (aiById[selected.conversionId] ?? EMPTY_AI_STATE) : EMPTY_AI_STATE;
+  const limitReached =
+    selectedAi.used !== undefined &&
+    selectedAi.limit !== undefined &&
+    selectedAi.limit > 0 &&
+    selectedAi.used >= selectedAi.limit;
 
   const downloadImageFile = useCallback(
     async (url: string, fileName: string, notAvailable: string) => {
@@ -104,21 +142,50 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
   }, []);
 
   const handleGenerate = useCallback(async () => {
-    if (!selected || generating) return;
+    if (!selected || generating || selectedAi.blocked) return;
     setGenerating(true);
     const id = selected.conversionId;
+    // Regeneration is only offered once an image already exists for this sheet;
+    // the flag is what lets the server spend a generation instead of replaying
+    // the cached result.
+    const regenerate = (aiById[id] ?? EMPTY_AI_STATE).hasImage;
     try {
-      const res = await generateAiImage(id);
-      setAiUsageById((prev) => ({ ...prev, [id]: { used: res.generationsUsed, limit: res.generationsLimit } }));
-      setGeneratedAi((prev) => ({ ...prev, [id]: true }));
-      toast.success("AI image generated successfully.");
+      const res = await generateAiImage(id, {
+        signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+        regenerate,
+      });
+      setAiById((prev) => ({
+        ...prev,
+        [id]: {
+          hasImage: true,
+          used: res.generationsUsed,
+          limit: res.generationsLimit,
+          blocked: res.blocked === true,
+        },
+      }));
+      toast.success(aiSuccessMessage(res));
     } catch (err) {
-      const message = err instanceof Error ? err.message : "AI generation failed.";
+      // A 429 carries the server's cap, so record it and stop offering the
+      // button rather than letting every click re-fire into the same refusal.
+      const apiError = err instanceof Error ? (err as ApiError) : undefined;
+      if (apiError?.details?.generationsLimit !== undefined) {
+        const limit = apiError.details.generationsLimit;
+        setAiById((prev) => ({
+          ...prev,
+          [id]: { ...(prev[id] ?? EMPTY_AI_STATE), hasImage: true, used: limit, limit },
+        }));
+      }
+      const message =
+        err instanceof DOMException && err.name === "TimeoutError"
+          ? "The AI request took too long. Please try again."
+          : err instanceof Error
+            ? err.message
+            : "AI generation failed.";
       toast.error(message);
     } finally {
       setGenerating(false);
     }
-  }, [generating, selected]);
+  }, [aiById, generating, selected, selectedAi.blocked]);
 
   const handleTilesview = useCallback(async () => {
     if (!selected || sendingToTilesview) return;
@@ -129,7 +196,9 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
     // succeeds. The app tab stays open.
     const opener = window.open("", "_blank");
     try {
-      const res = await sendToTilesview(selected.conversionId);
+      const res = await sendToTilesview(selected.conversionId, {
+        signal: AbortSignal.timeout(TILESVIEW_REQUEST_TIMEOUT_MS),
+      });
       toast.success(`Sent to TilesView. Room ID: ${res.customRoomsId}. Opened in a new tab.`);
       if (opener && !opener.closed) {
         opener.location.href = res.visualizerUrl;
@@ -143,7 +212,12 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
       }
     } catch (err) {
       opener?.close();
-      const message = err instanceof Error ? err.message : "Sending to TilesView failed.";
+      const message =
+        err instanceof DOMException && err.name === "TimeoutError"
+          ? "Sending to TilesView took too long. Please try again."
+          : err instanceof Error
+            ? err.message
+            : "Sending to TilesView failed.";
       toast.error(message);
     } finally {
       setSendingToTilesview(false);
@@ -166,9 +240,6 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
       setDownloadingAi(false);
     }
   }, [downloadingAi, downloadImageFile, selected]);
-
-  const selectedAiDone = selected ? Boolean(generatedAi[selected.conversionId]) : false;
-  const selectedAiUsage = selected ? aiUsageById[selected.conversionId] : undefined;
 
   const lightboxResult = lightbox
     ? results.find((r) => r.conversionId === lightbox.id) ?? null
@@ -210,7 +281,7 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
           {omittedBlankSheets.length > 0 && (
             <p className="text-[12px] font-medium text-amber-600 dark:text-amber-400">
               {omittedBlankSheets.length} sheet{omittedBlankSheets.length === 1 ? "" : "s"} produced no PNG
-              {omittedBlankSheets.length === 1 ? "" : "s"}: 
+              {omittedBlankSheets.length === 1 ? "" : "s"}:{" "}
               {omittedBlankSheets.slice(0, 3).map(describeOmitted).join(", ")}
               {omittedBlankSheets.length > 3 ? "…" : ""}.
             </p>
@@ -228,7 +299,7 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
       <div className="grid grid-cols-1 gap-4 items-start sm:grid-cols-2 xl:grid-cols-3">
         {results.map((result, index) => {
           const isSelected = result.conversionId === selected?.conversionId;
-          const aiDone = Boolean(generatedAi[result.conversionId]);
+          const aiDone = Boolean(aiById[result.conversionId]?.hasImage);
           const skipped = result.statistics?.skippedEntities ?? 0;
           const warnings = Array.from(new Set(result.warnings ?? []));
           return (
@@ -267,17 +338,17 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
                 onDownload={() => handleDownload(result)}
               />
 
-<div className="mt-2 flex flex-wrap items-center justify-between gap-2 px-1">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-9 rounded-xl text-xs font-semibold"
-                    onClick={() => handleSelect(result)}
-                  >
-                    <MousePointerClick className="size-3.5" />
-                    {isSelected ? "Selected" : "Select for AI"}
-                  </Button>
-                </div>
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 px-1">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-9 rounded-xl text-xs font-semibold"
+                  onClick={() => handleSelect(result)}
+                >
+                  <MousePointerClick className="size-3.5" />
+                  {isSelected ? "Selected" : "Select for AI"}
+                </Button>
+              </div>
             </div>
           );
         })}
@@ -301,7 +372,7 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
             <p className="px-1 text-center text-sm text-muted-foreground">
               No sheet selected.
             </p>
-) : (
+          ) : (
             <>
               <div className="rounded-xl border border-border/70 bg-card/60 p-3">
                 <p className="mb-1 flex items-center gap-1.5 text-[13px] font-medium text-foreground">
@@ -309,6 +380,13 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
                   &ldquo;{selected.sheetName ?? selected.fileName}&rdquo;
                 </p>
               </div>
+
+              {selectedAi.blocked && (
+                <p className="px-1 text-[11px] text-muted-foreground">
+                  This sheet&rsquo;s AI image is already cached and will be reused. Convert the DWG again
+                  after the cache expires to generate a new one.
+                </p>
+              )}
 
               {generating ? (
                 <div className="flex h-20 items-center justify-center gap-2 rounded-xl border border-border/70 bg-card/60 text-sm text-muted-foreground">
@@ -319,21 +397,22 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
                 <Button
                   className="h-10 w-full rounded-xl bg-linear-to-r from-amber-500 to-orange-500 text-sm font-semibold text-white shadow-md shadow-amber-500/25 transition-all hover:from-amber-500 hover:to-orange-600 hover:shadow-amber-500/35 disabled:from-amber-500/60 disabled:to-orange-500/60"
                   onClick={handleGenerate}
+                  disabled={limitReached || selectedAi.blocked}
                 >
                   <Sparkles />
-                  {selectedAiDone ? "Regenerate AI image" : "Generate AI image"}
-                  {selectedAiUsage ? ` (${selectedAiUsage.used}/${selectedAiUsage.limit})` : ""}
+                  {selectedAi.hasImage ? "Regenerate AI image" : "Generate AI image"}
+                  {generationTally(selectedAi)}
                 </Button>
               )}
 
-              {selectedAiUsage && selectedAiUsage.used >= selectedAiUsage.limit && (
+              {limitReached && !selectedAi.blocked && (
                 <p className="px-1 text-center text-xs text-muted-foreground">
-                  Generation limit reached ({selectedAiUsage.limit}/{selectedAiUsage.limit}) for this sheet.
+                  Generation limit reached ({selectedAi.limit}/{selectedAi.limit}) for this sheet.
                   Convert the DWG again to generate more.
                 </p>
               )}
 
-              {selectedAiDone && !generating && (
+              {selectedAi.hasImage && !generating && (
                 <div className="animate-slide-up">
                   <ImagePreviewCard
                     src={aiDownloadUrl(selected.conversionId)}
@@ -342,9 +421,22 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
                     onToggleBig={() => setLightbox({ kind: "ai", id: selected.conversionId })}
                     onDownload={handleAiDownload}
                   />
-                  <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                  <div className="mt-3 flex flex-col gap-2">
+                    {selectedAi.hasImage && !limitReached && !selectedAi.blocked && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-9 w-full rounded-xl text-xs font-semibold"
+                        onClick={handleGenerate}
+                        disabled={generating || sendingToTilesview}
+                      >
+                        {generating ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                        Regenerate AI image{generationTally(selectedAi)}
+                      </Button>
+                    )}
                     <Button
-                      className="h-11 flex-1 rounded-xl bg-linear-to-r from-indigo-500 to-violet-500 text-sm font-semibold text-white shadow-lg shadow-indigo-500/30 transition-all hover:from-indigo-500 hover:to-violet-600 hover:shadow-indigo-500/40 disabled:from-indigo-500/60 disabled:to-violet-500/60"
+                      size="sm"
+                      className="h-11 w-full rounded-xl bg-linear-to-r from-indigo-500 to-violet-500 text-sm font-semibold text-white shadow-lg shadow-indigo-500/30 transition-all hover:from-indigo-500 hover:to-violet-600 hover:shadow-indigo-500/40 disabled:from-indigo-500/60 disabled:to-violet-500/60"
                       onClick={handleTilesview}
                       disabled={sendingToTilesview}
                     >
@@ -396,4 +488,15 @@ export default function ConversionResult({ results, omittedBlankSheets = [], onR
       />
     </div>
   );
+}
+
+/** Toast copy per response origin, so a reused image never reads as a new one. */
+function aiSuccessMessage(res: AiImageResult): string {
+  if (res.cached) {
+    return "Reused an AI image generated earlier for this drawing.";
+  }
+  if (res.regenerate) {
+    return "New AI image generated.";
+  }
+  return "AI image generated successfully.";
 }

@@ -66,6 +66,8 @@ export default function ImagePreviewCard({
         </span>
       )}
 
+      {/* Expand and Download live here. Generation lives in the AI
+          visualization section below the grid, operating on the selected sheet. */}
       <div className="absolute right-2.5 bottom-2.5 flex gap-1.5">
         <button
           type="button"
