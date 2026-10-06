@@ -222,4 +222,4 @@ dwg2png/
             │                    #   Layer / Block
             └── utils/           # geometry, errors, fileValidation, lineWeight,
                                  #   rateLimit, storage
-```
+```# dwgconverter
