@@ -181,7 +181,8 @@ Keep the actual architectural elements represented by the text or annotations un
 Most important: The uploaded drawing is the source of truth. Prioritize its geometry, layout, proportions, and design over assumptions. Only add realistic rendering qualities needed to visualize the design in the real world.
 Do not reinterpret the design. Do not introduce a new design. Do not make creative architectural changes.
 Output a high-resolution, photorealistic final visualization of the uploaded drawing, with the architectural design preserved exactly and without any visible text or technical annotations.
-ABSOLUTE REQUIREMENT: The final generated image must be completely text-free. No letters, words, numbers, labels, dimensions, annotations, symbols, or written markings of any kind should appear anywhere in the image.`;
+ABSOLUTE REQUIREMENT: The final generated image must be completely text-free. No letters, words, numbers, labels, dimensions, annotations, symbols, or written markings of any kind should appear anywhere in the image.
+`;
 
 /**
  * Configuration is read from the environment on every call so that tests can
