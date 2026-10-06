@@ -348,6 +348,20 @@ function backgroundRect(canvasWidth: number, canvasHeight: number): string {
   return `<rect x="0" y="0" width="${canvasWidth}" height="${canvasHeight}" fill="#ffffff"/>`;
 }
 
+const EMBEDDED_FONT_FAMILY = "Dwg Sans";
+
+function deploymentBaseUrl(): string {
+  const url = (process.env.VERCEL_URL ?? "").trim();
+  return url ? `https://${url}` : "";
+}
+
+function fontFaceStyle(): string {
+  const base = deploymentBaseUrl();
+  return base
+    ? `<style>@font-face{font-family:"${EMBEDDED_FONT_FAMILY}";src:url("${base}/fonts/Roboto-Regular.ttf") format("truetype");}</style>`
+    : "";
+}
+
 function renderModelToSvg(drawing: Drawing, options: RenderOptions): string {
   const ctx = buildContext(drawing.bounds, options);
   const supersample = resolveSupersample(options.supersample ?? 1, ctx.viewport.canvasWidth, ctx.viewport.canvasHeight);
@@ -357,6 +371,7 @@ function renderModelToSvg(drawing: Drawing, options: RenderOptions): string {
   const parts: string[] = [
     svgHeader(canvasWidth, canvasHeight),
     backgroundRect(canvasWidth, canvasHeight),
+    fontFaceStyle(),
     ...(supersample > 1 ? [`<g transform="scale(${supersample})">`] : []),
     "<g>",
   ];
@@ -375,6 +390,7 @@ function renderPageToSvg(drawing: Drawing, options: RenderOptions): string {
   const parts: string[] = [
     svgHeader(canvasWidth, canvasHeight),
     backgroundRect(canvasWidth, canvasHeight),
+    fontFaceStyle(),
     ...(supersample > 1 ? [`<g transform="scale(${supersample})">`] : []),
   ];
 
@@ -930,5 +946,7 @@ function escapeAttr(value: string): string {
 }
 
 function getDefaultFont(): string {
-  return "Segoe UI, Arial, Helvetica, sans-serif";
+  return deploymentBaseUrl()
+    ? `${EMBEDDED_FONT_FAMILY}, Segoe UI, Arial, Helvetica, sans-serif`
+    : "Segoe UI, Arial, Helvetica, sans-serif";
 }
