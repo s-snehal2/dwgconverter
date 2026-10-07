@@ -9,20 +9,12 @@ export function normalizeAngle(angle: number): number {
   return a < 0 ? a + TAU : a;
 }
 
-export function degToRad(degrees: number): number {
-  return (degrees * Math.PI) / 180;
-}
-
 export function radToDeg(radians: number): number {
   return (radians * 180) / Math.PI;
 }
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
-}
-
-export function approxEqual(a: number, b: number, epsilon = 1e-9): boolean {
-  return Math.abs(a - b) <= epsilon;
 }
 
 export interface BulgeArc {

@@ -171,7 +171,6 @@ dwg2png/
 │   │       │   ├── tilesview.ts                # TilesView room publish
 │   │       │   ├── supabaseStore.ts            # Supabase Storage adapter
 │   │       │   ├── outputStore.ts              # outputs/ (bucket or disk)
-│   │       │   ├── uploadStore.ts              # staged uploads/{uuid}.dwg
 │   │       │   └── fileCleanup.ts              # age-based disk/bucket sweep
 │   │       └── utils/
 │   │           ├── errors.ts                   # ErrorCode taxonomy + HTTP mapping
@@ -203,20 +202,16 @@ On every `POST /api/convert`:
 
 1. **Rate limit** — `takeRateLimit(clientIp(request), …)` rejects with
    `RATE_LIMITED` when the per-IP budget is exceeded.
-2. **Intake** — `content-type: application/json` selects the direct-upload path
-   (`uploadPath` is checked with `isTrustedUploadPath`, then read back and
-   measured); anything else is parsed as multipart with a single `file` field,
-   converted straight out of the request buffer.
+2. **Intake** — multipart with a single `file` field, converted straight out of
+   the request buffer; the DWG bytes are never written to disk or storage.
 3. **Validation** — extension must be `.dwg` (`validateExtension`) and size
    within `MAX_FILE_SIZE_MB` (`validateFileSize`).
 4. **Expired-object sweep** — `sweepExpiredOutputsThrottled` reclaims stale
-   `outputs/` and `uploads/` objects (best effort; failures are logged, not
-   fatal). This runs *after* intake on purpose: a directly-uploaded DWG is still
-   sitting in `uploads/` waiting to be read, and the sweep covers that prefix,
-   so sweeping first could delete the file this request is about to convert.
+   `outputs/`, legacy `uploads/` and AI-pair cache objects (best effort;
+   failures are logged, not fatal). This runs *after* intake on purpose so
+   rejected or malformed requests never pay for a bucket scan.
 5. **Convert** — calls `convertDwg(buffer, config)`, stores the PNG and a
    `.name` sidecar, returns the JSON result with statistics.
-6. **Cleanup** — a staged `uploadPath` is always deleted in a `finally` block.
 
 Sheet names and file names come out of the DWG and may contain control
 characters; every value that reaches a log line is escaped by `logSafe` so a
@@ -255,8 +250,7 @@ if (sheets.length === 0) throw new AppError("NO_DRAWABLE_CONTENT", "…");
 - **Selection** — `selectViewsForConversion` returns **every** paper-space
   layout view in draw order, followed by the model-space crops. If the renderable
   layout count exceeds `maxLayouts` it throws `MULTIPLE_LAYOUTS`; with no content
-  at all it throws `NO_DRAWABLE_CONTENT`. `selectViewForConversion` remains as
-  the single-sheet helper (`selectViewsForConversion(...)[0]`).
+  at all it throws `NO_DRAWABLE_CONTENT`.
 - **Model clustering** — `expandModelView` turns the single model view into one
   view per drawing cluster via `modelClusterer.clusterModelEntities`, named
   `Model`, `Model 2`, ... The cluster's own bounds flow into `computeViewport`,
@@ -391,12 +385,18 @@ no acad-ts imports). It emits a plain SVG in **final pixel coordinates**
 - **Supersampling** — the SVG is emitted at `supersample × target size`, then
   sharp downsamples it (anti-aliasing). `MAX_SUPERSAMPLED_EDGE = 6144` scales
   the supersample back so no canvas edge explodes.
-- **Geometry quality** — arcs and ellipses are sampled with an adaptive step
-  that keeps chord error at ~0.25 px (`arcStep`); polyline bulges are rebuilt
-  into arcs via `arcFromBulge`; ellipse geometry derives the minor axis from
-  the major-axis endpoint and `radiusRatio`.
-- **Line weights** — `mapLineWeightToPixels` (Raw DWG 1/100 mm → px), floored
-  at `MIN_STROKE_PX` so hairlines don't vanish.
+- **Geometry quality** — circles emit `<circle>` and arcs emit native SVG
+  elliptical-arc path commands (`A`) via `circleArcPathD`, with the sweep flag
+  derived from the world-CCW span (no point sampling, so a chord error never
+  appears); polyline bulges are rebuilt into arcs via `arcFromBulge`; partial
+  ellipses use the same `A` command with rx/ry and `x-axis-rotation`, and a
+  full ellipse is split into two half arcs. Ellipse geometry derives the minor
+  axis from the major-axis endpoint and `radiusRatio`.
+- **Line weights** — `mapLineWeightToPixels` converts the raw DWG weight
+  (1/100 mm) to pixels using the document's `$INSUNITS` (drawing units per mm)
+  times the viewport scale, so strokes come out plot-accurate for the sheet
+  (~2–3 px for 0.25 mm on a 3000 px A4); floored at `MIN_STROKE_PX` so
+  hairlines don't vanish and capped at 16 px as a guard against corrupt values.
 - **Text** — rendered as `<text>` with font-size from CAD cap height
   (÷ 0.7 em ratio), rotation, oblique angle and width factor. Multi-line MTEXT
   becomes one `<tspan>` per line at 1.5× pitch, wrapped to the MTEXT rectangle
@@ -410,14 +410,12 @@ no acad-ts imports). It emits a plain SVG in **final pixel coordinates**
   were visible inside it — the classic "text is missing" bug. Underestimating
   the same box clips labels at the sheet edge. Alignment is currently fixed to
   left/baseline (see [Known limitations](#known-limitations)).
-- **Colors** — monochrome is the default: pure black strokes and black labels on
-  white. Substantial filled regions are still painted light grey
-  (`MONOCHROME_HIGHLIGHT_FILL`, `#d4d4d4`) so a hatch or a marked-up area reads
-  as a highlight instead of collapsing into plain black line work; small filled
-  marks stay stroke-only, which is what keeps arrowheads crisp (see
-  [Solid fills](#known-limitations)). `COLOR_MODE=color` is opt-in and uses the
-  resolved entity colors instead, painting `filled` regions in the DWG's own
-  colour at `HIGHLIGHT_FILL_OPACITY`.
+- **Colors** — `COLOR_MODE=color` is the default: strokes and labels use the
+  resolved entity colors, and `filled` regions are painted opaquely in the
+  DWG's own colour, exactly as AutoCAD fills them. `COLOR_MODE=monochrome`
+  renders pure black-and-white line work instead — outlines only, with no
+  fill, so black strokes are never buried under a filled region (see
+  [Solid fills](#known-limitations)).
 
 ### 6. Rasterization — `pngGenerator.ts`
 
@@ -648,20 +646,13 @@ an internal stack trace (see [Errors](#errors--rate-limiting)).
 
 A tombstone that answers **404** to both methods. Direct-to-storage upload is
 removed: a signed PUT URL is a durable public handle on DWG bytes, and nothing
-here needs one. `/api/convert` still accepts a JSON `uploadPath`, so a DWG
-staged by an earlier version of this app (or written out of band) can still be
-converted; only the minting side is gone.
+here needs one. A DWG only ever travels as multipart to `/api/convert`, is
+parsed in memory, and is never persisted.
 
 ### `POST /api/convert`
 
-Accepts either:
-
-- `multipart/form-data` with a `file` field (`*.dwg`) — the only path the browser
-  uses, and
-- JSON `{ uploadPath, fileName }` — naming a DWG already staged in storage.
-
-In the JSON case the size check runs against the bytes actually read back, not
-anything the client claimed.
+Accepts `multipart/form-data` with a `file` field (`*.dwg`) — the only intake
+path.
 
 - Runtime: `nodejs`, `maxDuration: 300`.
 - Validates: extension, size, DWG signature/version, sheet count, rate limit.
@@ -690,9 +681,7 @@ anything the client claimed.
 }
 ```
 
-- **4xx/5xx** on failure (see error table); any staged upload (`uploadPath`)
-  is deleted either way. In multipart mode the temporary disk file is removed
-  in `finally`.
+- **4xx/5xx** on failure (see error table).
 - `GET` returns 405 with a hint.
 
 ### `POST /api/generate/[id]`
@@ -808,7 +797,7 @@ effective limit is multiplied by the number of warm instances.
 ## Storage & file lifecycle
 
 `server/services/supabaseStore.ts` is the only module that talks to the bucket.
-`outputStore` and `uploadStore` call it, and fall back to disk when
+`outputStore` and `aiPairCache` call it, and fall back to disk when
 `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are unset, so local dev needs no
 credentials.
 
@@ -827,13 +816,14 @@ credentials.
            {id}.ai.png.count  # successful generations (generation limit)
   ai-outputs/{aiPairId}.ai.png # the image Gemini returned
   ai-outputs/{aiPairId}.meta.json # identity + createdAt / expiresAt
-  uploads/{uuid}.dwg          # staged DWG; deleted right after conversion
   ```
 
   The prefix split is what lets retention differ per group: `outputs/` lives for
-  `CLEANUP_AGE_MINUTES` and `ai-outputs/` for `CACHE_AGE_MINUTES`, while
-  `uploads/` exists only for the length of one conversion. Without Supabase
-  nothing is persisted at all, so every request costs a Gemini call.
+  `CLEANUP_AGE_MINUTES` and `ai-outputs/` for `CACHE_AGE_MINUTES`. No DWG is
+  ever stored: the multipart bytes are parsed in memory and discarded, and the
+  legacy `uploads/` prefix has no writer anymore — the sweep still walks it so
+  anything an earlier version staged gets reclaimed. Without Supabase nothing is
+  persisted at all, so every request costs a Gemini call.
 
   `outputs/` holds **both** the converted PNG and the generated AI image for the
   same conversion, so a single `CLEANUP_AGE_MINUTES` window covers both. It is
@@ -847,8 +837,7 @@ credentials.
 
 - **IDs** — `newConversionId()` = `randomUUID()`. `isSafeConversionId` enforces
   the strict UUID pattern on every route that accepts an id, so path traversal
-  is impossible. A staged `uploadPath` is additionally checked against
-  `uploads/{uuid}.dwg` by `isTrustedUploadPath`.
+  is impossible.
 - **Uploads** — the browser always POSTs multipart to `/api/convert`, so a DWG
   is bounded by the platform's request-body limit (~4.5 MB), not by
   `MAX_FILE_SIZE_MB`. The signed-URL path that used to bypass it is removed.
@@ -1083,22 +1072,16 @@ substituted SHX glyphs, unresolved XREFs, OLE/underlay frames).
   instances are expanded (avoids wasting CPU on never-inserted definitions).
 - **Solid fills** — a `SOLID`/`3DFACE` polygon, an expanded solid hatch and a
   leader arrowhead all record the DWG's fill intent in `Entity.filled`. In
-  **monochrome** a `filled` region is painted light grey
-  (`MONOCHROME_HIGHLIGHT_FILL`, `#d4d4d4`) when it covers at least
-  `MONOCHROME_HIGHLIGHT_MIN_AREA_FRACTION` (0.05%) of the drawing's own bounds,
-  and stroked in black otherwise. Reusing the stroke colour as the fill forced
-  `#000000` (and `resolveColorHex` rewrites near-white to black as well), so one
-  large filled region painted over a third of the sheet and buried the line work
-  — `Fluting sample display (2)` measured 33.8% ink coverage before, 15.3% after.
-  The area threshold is what excludes arrowheads: they are `filled` `SOLID`s too,
-  but a fraction of a percent of a sheet, and grey-filling them put a blob next to
-  every dimension. Measuring against the drawing's bounds rather than an absolute
-  unit area keeps the threshold meaningful on a 36-unit sheet and a 4,000-unit site
-  plan alike. In **color mode** (`COLOR_MODE=color`) the DWG's own colour is kept
-  and every `filled` region is painted at `HIGHLIGHT_FILL_OPACITY` (0.2), which
-  is what makes a highlight legible without letting the fill bury the line work.
-  Light-grey fill departs from AutoCAD, whose default `monochrome.ctb` plots
-  solid hatches as solid black.
+  **color mode** (`COLOR_MODE=color`, the default) the DWG's own colour is kept
+  and every `filled` region is painted opaquely, exactly as AutoCAD fills it.
+  In **monochrome** nothing is filled: the outline is stroked in black only.
+  Reusing the stroke colour as the fill would force `#000000` (and
+  `resolveColorHex` rewrites near-white to black as well), so one large filled
+  region painted over a third of the sheet and buried the line work —
+  `Fluting sample display (2)` measured 33.8% ink coverage before, 15.3% after.
+  A light-grey "highlight" fill with an area threshold used to sit between the
+  two modes; it was removed once colour rendering became the product, since
+  colour mode ignores it entirely.
 - **Color extremes** — near-white colors resolve to black for stroke
   visibility on the white background. This applies to strokes only, never to
   fills.

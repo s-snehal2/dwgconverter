@@ -23,9 +23,10 @@ function clampFileName(name: string): string {
 const OUTPUT_PREFIX = "outputs/";
 
 /**
- * Staging prefix for inbound DWGs. Duplicated from `uploadStore` on purpose so
- * neither store imports the other, but it must stay byte-identical to
- * `UPLOAD_KEY_RE` there or this sweep would never match a real upload.
+ * Legacy staging prefix for inbound DWGs. Nothing writes here anymore — direct
+ * uploads are disabled and `/api/convert` parses multipart bytes in memory —
+ * but the sweep still walks it so any object an earlier version staged is
+ * reclaimed instead of lingering in the bucket.
  */
 const UPLOAD_PREFIX = "uploads/";
 
@@ -347,102 +348,6 @@ export async function releaseAiGenerationClaim(id: string): Promise<void> {
 function parseCount(stored: string | null): number {
   const parsed = Number.parseInt(stored ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-}
-
-/** Drawing-level AI generation counter (keyed by sourceHash, survives re-uploads). */
-const DRAWING_COUNT_PREFIX = "outputs/ai-count-";
-
-function sanitizeForFs(sourceHash: string): string {
-  return sourceHash.replace(/:/g, "_");
-}
-
-function drawingCountKey(sourceHash: string): string {
-  const safeHash = sanitizeForFs(sourceHash);
-  return `${DRAWING_COUNT_PREFIX}${safeHash}.count`;
-}
-
-const drawingGenerationLocks = new Map<string, Promise<unknown>>();
-
-function withDrawingGenerationLock<T>(sourceHash: string, fn: () => Promise<T>): Promise<T> {
-  const previous = drawingGenerationLocks.get(sourceHash) ?? Promise.resolve();
-  const result = previous.then(fn, fn);
-  const settled = result.then(
-    () => undefined,
-    () => undefined
-  );
-  drawingGenerationLocks.set(sourceHash, settled);
-  void settled.then(() => {
-    if (drawingGenerationLocks.get(sourceHash) === settled) {
-      drawingGenerationLocks.delete(sourceHash);
-    }
-  });
-  return result;
-}
-
-export async function getAiGenerationCountForDrawing(sourceHash: string): Promise<number> {
-  if (isSupabaseEnabled()) {
-    return parseCount(await getObjectText(drawingCountKey(sourceHash)));
-  }
-  const config = getConfig();
-  const safeHash = sanitizeForFs(sourceHash);
-  const abs = `${config.outputsDir}/ai-count-${safeHash}.count`;
-  const stored = readIfExists(abs);
-  return parseCount(stored ? stored.toString("utf8") : null);
-}
-
-async function incrementAiGenerationCountForDrawing(sourceHash: string): Promise<number> {
-  const next = (await getAiGenerationCountForDrawing(sourceHash)) + 1;
-  if (isSupabaseEnabled()) {
-    await putObject(drawingCountKey(sourceHash), String(next), "text/plain");
-    return next;
-  }
-  const config = getConfig();
-  ensureTempDirs(config);
-  writeBufferFileAtomic(
-    `${config.outputsDir}/ai-count-${sourceHash}.count`,
-    Buffer.from(String(next), "utf8")
-  );
-  return next;
-}
-
-export async function claimAiGenerationForDrawing(sourceHash: string, limit: number): Promise<AiGenerationClaim> {
-  return withDrawingGenerationLock(sourceHash, async () => {
-    const used = await getAiGenerationCountForDrawing(sourceHash);
-    if (used >= limit) {
-      return { generationsUsed: used, claimed: false };
-    }
-    return { generationsUsed: await incrementAiGenerationCountForDrawing(sourceHash), claimed: true };
-  });
-}
-
-export async function releaseAiGenerationClaimForDrawing(sourceHash: string): Promise<void> {
-  await withDrawingGenerationLock(sourceHash, async () => {
-    const next = (await getAiGenerationCountForDrawing(sourceHash)) - 1;
-    if (next <= 0) {
-      if (isSupabaseEnabled()) {
-        await removeObjects([drawingCountKey(sourceHash)]);
-        return;
-      }
-      const config = getConfig();
-      ensureTempDirs(config);
-      try {
-        rmSync(`${config.outputsDir}/ai-count-${sourceHash}.count`, { force: true });
-      } catch {
-        // Best-effort.
-      }
-      return;
-    }
-    if (isSupabaseEnabled()) {
-      await putObject(drawingCountKey(sourceHash), String(next), "text/plain");
-      return;
-    }
-    const config = getConfig();
-    ensureTempDirs(config);
-    writeBufferFileAtomic(
-      `${config.outputsDir}/ai-count-${sourceHash}.count`,
-      Buffer.from(String(next), "utf8")
-    );
-  });
 }
 
 /**

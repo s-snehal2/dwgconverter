@@ -216,7 +216,7 @@ dwg2png/
             │                    #   convertDwg (orchestrator), fileCleanup,
             │                    #   geminiImage (AI image generation, Gemini),
             │                    #   supabaseStore (bucket adapter),
-            │                    #   outputStore (outputs), uploadStore (staged uploads),
+            │                    #   outputStore (outputs),
             │                    #   aiPairCache (AI image reuse)
             ├── models/          # normalized Drawing / Entity / Bounds /
             │                    #   Layer / Block

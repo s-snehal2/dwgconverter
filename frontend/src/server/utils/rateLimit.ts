@@ -70,10 +70,6 @@ function pruneExpired(now: number): void {
   }
 }
 
-export function clearRateLimits(): void {
-  windows.clear();
-}
-
 /**
  * Best-effort caller IP from proxy headers, falling back to a shared bucket.
  *

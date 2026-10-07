@@ -117,16 +117,21 @@ function expandModelView(
 
 /**
  * Select every sheet to convert, in draw order: each paper-space layout
- * followed by the model-space clusters. A DWG with more paper-space layouts
- * than `maxLayouts` is rejected with MULTIPLE_LAYOUTS so a degenerate file
- * cannot trigger an unbounded chain of renders; model clusters are instead
- * merged down to whatever budget the layouts leave behind, since coarsening
- * crops loses no drawing content.
+ * followed by the model space. A DWG with more paper-space layouts than
+ * `maxLayouts` is rejected with MULTIPLE_LAYOUTS so a degenerate file cannot
+ * trigger an unbounded chain of renders.
+ *
+ * Model space is a single full-extents sheet by default: one drawing in, one
+ * PNG out, showing the whole model. `clusterCrops` opts into splitting it into
+ * per-drawing crops — the pieces are merged down to whatever budget the layouts
+ * leave behind rather than dropped, so capping output only coarsens crops and
+ * never loses entities.
  */
 export function selectViewsForConversion(
   views: InspectedView[],
   maxLayouts = 100,
-  clusterOptions: ClusterOptions = DEFAULT_CLUSTER_OPTIONS
+  clusterOptions: ClusterOptions = DEFAULT_CLUSTER_OPTIONS,
+  clusterCrops = false
 ): InspectedView[] {
   if (views.length === 0) {
     throw new AppError("NO_DRAWABLE_CONTENT", "No drawable content was found in this DWG file.");
@@ -140,17 +145,11 @@ export function selectViewsForConversion(
   }
   const model = views.find((view) => view.isModel);
   const modelViews = model
-    ? expandModelView(model, clusterOptions, maxLayouts - layouts.length)
+    ? clusterCrops
+      ? expandModelView(model, clusterOptions, maxLayouts - layouts.length)
+      : [model]
     : [];
   return [...layouts, ...modelViews];
-}
-
-/**
- * Select the single drawable page for a one-shot conversion: the first
- * paper-space layout, else the raw model space.
- */
-export function selectViewForConversion(views: InspectedView[], maxLayouts = 1): InspectedView {
-  return selectViewsForConversion(views, maxLayouts)[0];
 }
 
 /**
@@ -229,6 +228,7 @@ export async function renderViewPng(
       maxHeight: maxDimension,
       margin: config.marginPx,
       minStrokePx: config.minStrokePx,
+      unitsPerMm: view.unitsPerMm,
       minTextCapPx: config.minTextCapPx,
       maxTextCapPx: config.maxTextCapPx,
       supersample: supersampleForEntities(view.drawing.entities.length, config.pngSupersample),
@@ -333,7 +333,7 @@ export async function convertDwg(
     gapFraction: config.modelClusterGapFraction,
     maxDepth: config.modelClusterMaxDepth,
     minEntities: DEFAULT_CLUSTER_OPTIONS.minEntities,
-  });
+  }, config.modelClusterCrops);
   const modelCount = selected.filter((view) => view.isModel).length;
   logger.info?.(
     `Parsed DWG${inspected.version ? ` (${inspected.version})` : ""}: ${selected.length} sheet(s) to consider` +
@@ -400,6 +400,12 @@ function versionFromHeader(raw: { document: { header?: { version?: unknown } | n
   return typeof version === "string" ? version : null;
 }
 
+/**
+ * Colors are drawn with the DWG's own resolved RGB by default: the source
+ * drawing carries the designer's intent (layer colours, true-colour markups),
+ * and a monochrome render discards it. `COLOR_MODE=monochrome` restores the
+ * black-and-white render for deployments that want plot-style line work.
+ */
 function colorModeFromEnv(): RenderOptions["colorMode"] {
-  return process.env.COLOR_MODE?.toLowerCase() === "color" ? "color" : "monochrome";
+  return process.env.COLOR_MODE?.toLowerCase().trim() === "monochrome" ? "monochrome" : "color";
 }

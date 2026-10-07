@@ -57,6 +57,24 @@ export const MTEXT_LINE_PITCH = 1.5;
 /** Same pitch expressed in cap heights, i.e. in DWG units. */
 export const MTEXT_LINE_PITCH_CAP = MTEXT_LINE_PITCH / TEXT_CAP_HEIGHT_RATIO;
 
+/**
+ * Effective paragraph line-spacing factor of a text entity (`MTEXT.lineSpacing`).
+ *
+ * The DWG stores the spacing as a factor of the line height — 1.0 is the
+ * compact single-spacing of `MTEXT_LINE_PITCH`, 1.5 spreads lines 50% wider,
+ * and drawings use the field for anything from tight schedules to airy title
+ * text. Ignoring it stacked every multi-line label on the same rows no matter
+ * what the drawing asked for, so both the renderer's `dy` and the bounds
+ * multiply the pitch by this factor. TEXT has no such field and returns 1.
+ */
+export function mtextLineSpacing(entity: TextEntity | MTextEntity): number {
+  if (entity.type !== "MTEXT") {
+    return 1;
+  }
+  const spacing = (entity as { lineSpacing?: number }).lineSpacing;
+  return typeof spacing === "number" && Number.isFinite(spacing) && spacing > 0 ? spacing : 1;
+}
+
 /** Height used when a DWG stores 0 (AutoCAD then falls back to the style). */
 export const DEFAULT_TEXT_HEIGHT = 1;
 
@@ -89,7 +107,9 @@ export function glyphAdvanceCap(ch: string): number {
   if (WIDE_CHARS.has(ch)) {
     return ADVANCE_WIDE;
   }
-  if (ch === " ") {
+  // Non-breaking space is how the renderer draws an interior blank line —
+  // it must measure like the space it stands in for.
+  if (ch === " " || ch === "\u00a0") {
     return ADVANCE_SPACE;
   }
   if (ch >= "0" && ch <= "9") {
@@ -129,14 +149,26 @@ export function textWidthFactor(entity: TextEntity | MTextEntity): number {
 
 /**
  * The lines a text entity is drawn as, exactly as `renderText` splits them.
- * Empty lines are dropped so bounds and output agree.
+ *
+ * MTEXT keeps its paragraph structure: only *trailing* blank lines are
+ * dropped, while a leading or interior blank line is a real line break the
+ * drawing asked for and occupies its own row (the renderer inks it as a
+ * non-breaking space so the stack advances). Trimming every blank line, as
+ * this did before, pulled the lines below an indented paragraph up and moved
+ * labels the drawing deliberately spaced out. Leading whitespace is preserved
+ * for the same reason — the `<text>` element carries `xml:space="preserve"`
+ * so SVG does not collapse it away. Single-line TEXT is flattened to one row
+ * and dropped entirely when it carries no ink.
  */
 export function textLines(entity: TextEntity | MTextEntity): string[] {
-  const raw =
-    entity.type === "MTEXT"
-      ? (entity.text ?? "").split(/\r\n|\r|\n/)
-      : [(entity.text ?? "").replace(/\r|\n/g, " ")];
-  return raw.map((line) => line.trim()).filter((line) => line.length > 0);
+  if (entity.type !== "MTEXT") {
+    return [(entity.text ?? "").replace(/\r|\n/g, " ").trimEnd()].filter((line) => line.length > 0);
+  }
+  const lines = (entity.text ?? "").split(/\r\n|\r|\n/).map((line) => line.trimEnd());
+  while (lines.length > 0 && lines[lines.length - 1].length === 0) {
+    lines.pop();
+  }
+  return lines;
 }
 
 /** Greedy word wrap of one line to `maxWidth`, honouring CAD word wrapping. */
@@ -186,6 +218,7 @@ export function textBlockSize(entity: TextEntity | MTextEntity): TextBlockSize {
   const height = textHeight(entity);
   const widthFactor = textWidthFactor(entity);
   const natural = textLines(entity);
+  const lineCap = height * MTEXT_LINE_PITCH_CAP * mtextLineSpacing(entity);
 
   const fixedWidth = entity.type === "MTEXT" && entity.width > 0 ? entity.width : 0;
   if (fixedWidth > 0) {
@@ -200,7 +233,7 @@ export function textBlockSize(entity: TextEntity | MTextEntity): TextBlockSize {
       return {
         lines: wrapped,
         width: fixedWidth,
-        totalHeight: height + (wrapped.length - 1) * height * MTEXT_LINE_PITCH_CAP,
+        totalHeight: height + (wrapped.length - 1) * lineCap,
         wrapped: true,
       };
     }
@@ -213,7 +246,7 @@ export function textBlockSize(entity: TextEntity | MTextEntity): TextBlockSize {
   return {
     lines: natural,
     width,
-    totalHeight: height + (natural.length - 1) * height * MTEXT_LINE_PITCH_CAP,
+    totalHeight: height + Math.max(0, natural.length - 1) * lineCap,
     wrapped: false,
   };
 }

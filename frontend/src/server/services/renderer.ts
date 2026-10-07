@@ -5,12 +5,13 @@ import { computeViewport, pointToPixel, type Viewport } from "./coordinateMapper
 import { entityBounds } from "./boundsCalculator";
 import { projectEntityToPage } from "./viewportMapper";
 import { mapLineWeightToPixels } from "../utils/lineWeight";
-import { arcFromBulge, arcSpan, clamp, radToDeg, TAU } from "../utils/geometry";
+import { arcFromBulge, arcSpan, radToDeg, TAU } from "../utils/geometry";
 import {
-DEFAULT_MAX_TEXT_CAP_PX,
+  DEFAULT_MAX_TEXT_CAP_PX,
   DEFAULT_MIN_TEXT_CAP_PX,
   MTEXT_LINE_PITCH,
   TEXT_CAP_HEIGHT_RATIO,
+  mtextLineSpacing,
   textBlockSize,
   textEntityBounds,
   textHeight,
@@ -23,6 +24,12 @@ export interface RenderOptions {
   maxHeight: number;
   margin: number;
   minStrokePx?: number;
+  /**
+   * Drawing units per millimetre, from the DWG header. Lets lineweights
+   * (stored in mm) convert to plot-accurate pixel widths; defaults to 1
+   * (millimetres) when the caller does not supply the document's value.
+   */
+  unitsPerMm?: number;
   /**
    * Smallest cap height, in output pixels, any label may be drawn at. Defaults to
    * `DEFAULT_MIN_TEXT_CAP_PX`; overridable per render via `MIN_TEXT_CAP_PX`.
@@ -79,6 +86,7 @@ interface RenderContext {
   viewport: Viewport;
   colorMode: "monochrome" | "color";
   minStrokePx: number;
+  unitsPerMm: number;
   fontFamily: string;
   bounds: Drawing["bounds"];
   minTextCapPx: number;
@@ -312,10 +320,18 @@ function buildContext(bounds: Drawing["bounds"], options: RenderOptions): Render
     maxHeight,
     margin: Math.max(0, margin),
   });
+  // `MAX_TEXT_CAP_PX` absent or 0 means auto: the tuned default cap, and in
+  // every case a hard guard of the canvas itself so a runaway height can never
+  // outgrow the sheet it is drawn on.
+  const configuredCap =
+    Number.isFinite(options.maxTextCapPx) && (options.maxTextCapPx as number) > 0
+      ? (options.maxTextCapPx as number)
+      : DEFAULT_MAX_TEXT_CAP_PX;
   return {
     viewport,
     colorMode: options.colorMode,
     minStrokePx: options.minStrokePx ?? 1,
+    unitsPerMm: Number.isFinite(options.unitsPerMm) && (options.unitsPerMm as number) > 0 ? (options.unitsPerMm as number) : 1,
     fontFamily: options.fontFamily ?? getDefaultFont(),
     bounds,
     minTextCapPx:
@@ -324,10 +340,7 @@ function buildContext(bounds: Drawing["bounds"], options: RenderOptions): Render
         : Number.isFinite(options.minTextCapPx) && (options.minTextCapPx as number) > 0
           ? (options.minTextCapPx as number)
           : DEFAULT_MIN_TEXT_CAP_PX,
-    maxTextCapPx:
-      Number.isFinite(options.maxTextCapPx) && (options.maxTextCapPx as number) > 0
-        ? (options.maxTextCapPx as number)
-        : DEFAULT_MAX_TEXT_CAP_PX,
+    maxTextCapPx: Math.min(configuredCap, Math.max(1, viewport.canvasHeight / 2)),
   };
 }
 
@@ -529,8 +542,47 @@ function strokeColor(ctx: RenderContext, entity: { color: string }): string {
   return ctx.colorMode === "monochrome" ? "#000000" : entity.color;
 }
 
+/**
+ * Plot-accurate pixel width for an entity's lineweight.
+ *
+ * The DWG stores weight in millimetres; `ctx.unitsPerMm` (from `$INSUNITS`)
+ * turns that into drawing units and the viewport scale into pixels, so a
+ * 0.25 mm line lands at the same width AutoCAD would plot it at this sheet
+ * resolution (~2–3 px on a 3000 px A4) instead of blowing up to a clamp cap.
+ */
 function strokeWidth(ctx: RenderContext, entity: { lineWeight: number }): number {
-  return mapLineWeightToPixels(entity.lineWeight, ctx.viewport.scale, ctx.minStrokePx);
+  return mapLineWeightToPixels(entity.lineWeight, ctx.unitsPerMm, ctx.viewport.scale, ctx.minStrokePx);
+}
+
+/**
+ * `stroke-dasharray` for the entity's resolved linetype, in pixels.
+ *
+ * The DWG pattern is in drawing units, so it scales with the viewport exactly
+ * like the geometry it decorates. Two cases are left solid because they cannot
+ * be drawn honestly at this scale:
+ *
+ *  - a whole dash+gap cycle under ~1.5px: sub-pixel dashes alias into noise,
+ *    and at a 50% duty cycle the line visibly fades — AutoCAD itself renders
+ *    such fine dashes as a solid hairline;
+ *  - no dash segment reaching ~0.6px: nothing in the cycle is individually
+ *    resolvable, so the pattern would only grey the line out.
+ *
+ * An over-long dash (a huge LTSCALE) needs no special case: a dash wider than
+ * the canvas simply draws solid, which is also what AutoCAD shows.
+ *
+ * Empty string for Continuous / unresolved linetypes.
+ */
+function strokeDash(ctx: RenderContext, entity: { dashPattern?: number[] }): string {
+  const pattern = entity.dashPattern;
+  if (!pattern || pattern.length < 2) {
+    return "";
+  }
+  const lengths = pattern.map((length) => round(Math.max(length * ctx.viewport.scale, 0.25)));
+  const total = lengths.reduce((sum, length) => sum + length, 0);
+  if (total < 1.5 || Math.max(...lengths) < 0.6) {
+    return "";
+  }
+  return ` stroke-dasharray="${lengths.join(" ")}"`;
 }
 
 function px(point: CadPoint, ctx: RenderContext): { x: number; y: number } {
@@ -542,50 +594,65 @@ function round(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
-/** Arc ring-step that keeps the chord error close to 0.25 px. */
-function arcStep(radiusPx: number): number {
-  return clamp(2 * Math.asin(Math.min(1, 0.25 / Math.max(radiusPx, 1e-6))), Math.PI / 720, Math.PI / 45);
+/**
+ * `A` arc command for a pixel-space start point, given the arc's angular span
+ * in world space.
+ *
+ * The Y axis is inverted between world and pixel space, which turns a world
+ * CCW sweep (positive direction in DWG space) into sweep-flag 0. The large-arc
+ * flag is one exactly when the sweep covers more than a half turn.
+ */
+function arcCommand(
+  rxPx: number,
+  ryPx: number,
+  rotDeg: number,
+  span: number,
+  sweep: 0 | 1,
+  end: CadPoint
+): string {
+  const large = span > Math.PI ? 1 : 0;
+  return `A ${rxPx} ${ryPx} ${rotDeg} ${large} ${sweep} ${end.x} ${end.y}`;
 }
 
-/** Sample a circular arc (CCW from startAngle over `span`) into world points. */
-function sampleCircleArc(
+/** True when two pixel points coincide after rounding. */
+function samePixel(a: CadPoint, b: CadPoint): boolean {
+  return a.x === b.x && a.y === b.y;
+}
+
+/**
+ * Path `d` for a world-space circular arc drawn with SVG's native arc command.
+ *
+ * Curves are no longer polygon-sampled: the old sampling was bounded to a
+ * 0.25px chord error per segment (up to 1440 segments per arc, and visible as
+ * chunky facets on large radii), whereas the native command draws the exact
+ * ellipse. A sweep of a full turn would give SVG coincident endpoints — an
+ * arc with no end draws nothing — so full circles are split into two halves,
+ * which also covers arcs whose rounded endpoints collide.
+ */
+function circleArcPathD(
   center: CadPoint,
   radiusWorld: number,
-  scale: number,
   startAngle: number,
-  span: number
-): CadPoint[] {
-  const radiusPx = radiusWorld * scale;
-  const step = arcStep(radiusPx);
-  const count = Math.max(2, Math.min(1440, Math.ceil(span / step)));
-  const points: CadPoint[] = [];
-  for (let i = 0; i <= count; i++) {
-    const angle = startAngle + (span * i) / count;
-    points.push({
-      x: center.x + radiusWorld * Math.cos(angle),
-      y: center.y + radiusWorld * Math.sin(angle),
-    });
+  span: number,
+  ctx: RenderContext
+): string {
+  const r = round(radiusWorld * ctx.viewport.scale);
+  const at = (angle: number): CadPoint =>
+    px(
+      { x: center.x + radiusWorld * Math.cos(angle), y: center.y + radiusWorld * Math.sin(angle) },
+      ctx
+    );
+  const start = at(startAngle);
+  const end = at(startAngle + span);
+  if (span >= TAU - 1e-9 || samePixel(start, end)) {
+    const mid = at(startAngle + span / 2);
+    return `M ${start.x} ${start.y} ${arcCommand(r, r, 0, span / 2, 0, mid)} ${arcCommand(r, r, 0, span / 2, 0, start)}`;
   }
-  return points;
+  return `M ${start.x} ${start.y} ${arcCommand(r, r, 0, span, 0, end)}`;
 }
 
-function pathFromPoints(points: CadPoint[], ctx: RenderContext, closed: boolean): string {
-  if (points.length === 0) {
-    return "";
-  }
-  const parts: string[] = [];
-  for (let i = 0; i < points.length; i++) {
-    const p = px(points[i], ctx);
-    parts.push(`${i === 0 ? "M" : "L"} ${p.x} ${p.y}`);
-  }
-  if (closed && points.length > 2) {
-    parts.push("Z");
-  }
-  return parts.join(" ");
-}
-
-function strokePathElement(path: string, color: string, width: number): string {
-  return `<path d="${path}" fill="none" stroke="${color}" stroke-width="${width}" stroke-linejoin="round"/>`;
+function strokePathElement(path: string, color: string, width: number, dash = ""): string {
+  return `<path d="${path}" fill="none" stroke="${color}" stroke-width="${width}" stroke-linejoin="round"${dash}/>`;
 }
 
 /**
@@ -606,65 +673,92 @@ function bulgeSpan(
 }
 
 /**
- * Flatten one polyline (including bulge arcs) into a single ordered point
- * list in world coordinates.
+ * Path `d` for a polyline in pixel space, with bulge arcs as native SVG arcs.
  *
- * A closed polyline must close exactly once, at its own end. Emitting each
- * straight run and each sampled arc as an independent sub-path, and closing
- * *every* one of them, draws a spurious straight chord across each arc of a
- * closed bulged polyline. Keeping one continuous list means the single trailing
- * `Z` only closes the polyline itself.
+ * One continuous sub-path: a closed polyline must close exactly once, at its
+ * own end. Emitting each straight run and each arc as an independent sub-path
+ * and closing *every* one of them draws a spurious straight chord across each
+ * arc of a closed bulged polyline. Bulge arcs go through `arcFromBulge` —
+ * still geometry, no longer a sampled approximation — so an arc is one `A`
+ * command instead of up to 1440 `L` segments, and the arc's dash pattern
+ * measures against true arc length rather than the chorded one.
  */
-function polylinePathPoints(entity: Extract<Entity, { type: "POLYLINE" }>): CadPoint[] {
+function polylinePathD(entity: Extract<Entity, { type: "POLYLINE" }>, ctx: RenderContext): string {
   const points = entity.vertices;
   const bulges = entity.bulges;
   if (points.length === 0) {
-    return [];
+    return "";
   }
-  const out: CadPoint[] = [points[0]];
-
-  const appendSegment = (from: CadPoint, to: CadPoint, bulge: number): void => {
-    if (Math.abs(bulge) < 1e-6) {
-      out.push(to);
-      return;
-    }
+  const parts: string[] = [];
+  const moveTo = (p: CadPoint): void => {
+    const q = px(p, ctx);
+    parts.push(`M ${q.x} ${q.y}`);
+  };
+  const lineTo = (p: CadPoint): void => {
+    const q = px(p, ctx);
+    parts.push(`L ${q.x} ${q.y}`);
+  };
+  const arcTo = (from: CadPoint, to: CadPoint, bulge: number): void => {
     const arc = arcFromBulge(from, to, bulge);
     if (!arc) {
-      out.push(to);
+      lineTo(to);
       return;
     }
     const { start, span } = bulgeSpan(arc.startAngle, arc.endAngle, arc.clockwise);
-    const sampled = sampleCircleArc(arc.center, arc.radius, 1, start, span);
-    // The sampled arc starts at `from`, which is already the last point.
-    for (let k = 1; k < sampled.length; k++) {
-      out.push(sampled[k]);
+    const r = round(arc.radius * ctx.viewport.scale);
+    const end = px(to, ctx);
+    const sweep: 0 | 1 = arc.clockwise ? 1 : 0;
+    if (span >= TAU - 1e-9 || samePixel(px(from, ctx), end)) {
+      const mid = px(
+        {
+          x: arc.center.x + arc.radius * Math.cos(start + span / 2),
+          y: arc.center.y + arc.radius * Math.sin(start + span / 2),
+        },
+        ctx
+      );
+      parts.push(arcCommand(r, r, 0, span / 2, sweep, mid));
+      parts.push(arcCommand(r, r, 0, span / 2, sweep, end));
+      return;
     }
+    parts.push(arcCommand(r, r, 0, span, sweep, end));
   };
 
+  moveTo(points[0]);
   for (let i = 0; i < points.length - 1; i++) {
-    appendSegment(points[i], points[i + 1], bulges[i] ?? 0);
+    const bulge = bulges[i] ?? 0;
+    if (Math.abs(bulge) < 1e-6) {
+      lineTo(points[i + 1]);
+    } else {
+      arcTo(points[i], points[i + 1], bulge);
+    }
   }
   if (entity.closed && points.length > 1) {
-    appendSegment(points[points.length - 1], points[0], bulges[points.length - 1] ?? 0);
+    const last = points[points.length - 1];
+    const bulge = bulges[points.length - 1] ?? 0;
+    if (Math.abs(bulge) < 1e-6) {
+      lineTo(points[0]);
+    } else {
+      arcTo(last, points[0], bulge);
+    }
+    if (points.length > 2) {
+      parts.push("Z");
+    }
   }
-  return out;
+  return parts.join(" ");
 }
 
 function renderPolyline(ctx: RenderContext, entity: Extract<Entity, { type: "POLYLINE" }>): string[] {
-  const points = polylinePathPoints(entity);
-  if (points.length < 2) {
+  const path = polylinePathD(entity, ctx);
+  if (!path) {
     return [];
   }
-  const color = strokeColor(ctx, entity);
-  const width = strokeWidth(ctx, entity);
-  const path = pathFromPoints(points, ctx, entity.closed && points.length > 2);
-  return path ? [strokePathElement(path, color, width)] : [];
+  return [strokePathElement(path, strokeColor(ctx, entity), strokeWidth(ctx, entity), strokeDash(ctx, entity))];
 }
 
 function renderLine(ctx: RenderContext, entity: Extract<Entity, { type: "LINE" }>): string {
   const a = px(entity.start, ctx);
   const b = px(entity.end, ctx);
-  return `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${strokeColor(ctx, entity)}" stroke-width="${strokeWidth(ctx, entity)}"/>`;
+  return `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${strokeColor(ctx, entity)}" stroke-width="${strokeWidth(ctx, entity)}"${strokeDash(ctx, entity)}/>`;
 }
 
 function renderCircle(ctx: RenderContext, entity: Extract<Entity, { type: "CIRCLE" }>): string {
@@ -673,7 +767,7 @@ function renderCircle(ctx: RenderContext, entity: Extract<Entity, { type: "CIRCL
   }
   const c = px(entity.center, ctx);
   const r = round(entity.radius * ctx.viewport.scale);
-  return `<circle cx="${c.x}" cy="${c.y}" r="${r}" fill="none" stroke="${strokeColor(ctx, entity)}" stroke-width="${strokeWidth(ctx, entity)}"/>`;
+  return `<circle cx="${c.x}" cy="${c.y}" r="${r}" fill="none" stroke="${strokeColor(ctx, entity)}" stroke-width="${strokeWidth(ctx, entity)}"${strokeDash(ctx, entity)}/>`;
 }
 
 function renderArc(ctx: RenderContext, entity: Extract<Entity, { type: "ARC" }>): string {
@@ -681,14 +775,14 @@ function renderArc(ctx: RenderContext, entity: Extract<Entity, { type: "ARC" }>)
     return "";
   }
   const span = arcSpan(entity.startAngle, entity.endAngle);
-  const world = sampleCircleArc(
+  const path = circleArcPathD(
     { x: entity.center.x, y: entity.center.y },
     entity.radius,
-    ctx.viewport.scale,
     entity.startAngle,
-    span
+    span,
+    ctx
   );
-  return strokePathElement(pathFromPoints(world, ctx, false), strokeColor(ctx, entity), strokeWidth(ctx, entity));
+  return strokePathElement(path, strokeColor(ctx, entity), strokeWidth(ctx, entity), strokeDash(ctx, entity));
 }
 
 function renderEllipse(ctx: RenderContext, entity: Extract<Entity, { type: "ELLIPSE" }>): string {
@@ -703,20 +797,33 @@ function renderEllipse(ctx: RenderContext, entity: Extract<Entity, { type: "ELLI
   const minX = (-majY / majorLen) * minorLen;
   const minY = (majX / majorLen) * minorLen;
 
+  const rx = round(majorLen * ctx.viewport.scale);
+  const ry = round(Math.abs(minorLen) * ctx.viewport.scale);
+  // SVG measures x-axis-rotation in the coordinate system it is rendered in:
+  // pixel space has Y down, so the major axis angle is the negation of the
+  // world-space one.
+  const rot = round(-radToDeg(Math.atan2(majY, majX)));
+  const at = (t: number): CadPoint =>
+    px(
+      {
+        x: center.x + majX * Math.cos(t) + minX * Math.sin(t),
+        y: center.y + majY * Math.cos(t) + minY * Math.sin(t),
+      },
+      ctx
+    );
+
   const full = entity.full || Math.abs(arcSpan(startAngle, endAngle) - TAU) < 1e-6;
   const span = full ? TAU : arcSpan(startAngle, endAngle);
-  const step = arcStep(majorLen * ctx.viewport.scale);
-  const count = Math.max(2, Math.min(1440, Math.ceil(span / step)));
-
-  const world: CadPoint[] = [];
-  for (let i = 0; i <= count; i++) {
-    const t = startAngle + (span * i) / count;
-    world.push({
-      x: center.x + majX * Math.cos(t) + minX * Math.sin(t),
-      y: center.y + majY * Math.cos(t) + minY * Math.sin(t),
-    });
+  const start = at(startAngle);
+  const end = at(startAngle + span);
+  let path: string;
+  if (full || samePixel(start, end)) {
+    const mid = at(startAngle + span / 2);
+    path = `M ${start.x} ${start.y} ${arcCommand(rx, ry, rot, span / 2, 0, mid)} ${arcCommand(rx, ry, rot, span / 2, 0, start)}`;
+  } else {
+    path = `M ${start.x} ${start.y} ${arcCommand(rx, ry, rot, span, 0, end)}`;
   }
-  return strokePathElement(pathFromPoints(world, ctx, full), strokeColor(ctx, entity), strokeWidth(ctx, entity));
+  return strokePathElement(path, strokeColor(ctx, entity), strokeWidth(ctx, entity), strokeDash(ctx, entity));
 }
 
 function renderPoint(ctx: RenderContext, entity: Extract<Entity, { type: "POINT" }>): string {
@@ -725,74 +832,16 @@ function renderPoint(ctx: RenderContext, entity: Extract<Entity, { type: "POINT"
 }
 
 /**
- * Opacity used when a filled region is painted in color mode. Low enough that
- * the line work underneath still reads, high enough that the fill is legible
- * as a highlight.
- */
-const HIGHLIGHT_FILL_OPACITY = 0.2;
-
-/**
- * Light grey used to fill substantial regions in monochrome mode.
- *
- * Deliberately not `HIGHLIGHT_FILL_OPACITY`-faded black: a faded black fill over
- * dense line work greys the line work itself. A flat light grey paints the
- * region without touching the black strokes on top of it, so the drawing stays
- * crisp and only the filled area separates. `#d4d4d4` is light enough to read
- * text through and dark enough to be unmistakably a fill.
- */
-const MONOCHROME_HIGHLIGHT_FILL = "#d4d4d4";
-
-/**
- * Smallest share of the sheet a filled region must cover to count as a highlight.
- *
- * Measured against the drawing's own bounds, not an absolute unit area, so it
- * holds for a 36-unit sheet and a 4000-unit site plan alike. 0.05% of a 3000px
- * sheet is a 21x21px patch: above it a slab, floor finish or marked-up material
- * reads as a highlight; below it only small marks qualify.
- *
- * This threshold is what excludes arrowheads. Dimension and leader arrowheads are
- * `SOLID`s with `filled: true` (see `extractLeader` and the `*D` block entities
- * expanded by `expandDimensionBlock`), but they are tiny — an arrowhead is a
- * fraction of a percent of a sheet. Grey-filling them turned every dimension in
- * the drawing into a grey blob and was the second thing the customer noticed
- * about the oversized text, since they sit right next to it.
- */
-const MONOCHROME_HIGHLIGHT_MIN_AREA_FRACTION = 0.0005;
-
-/** Shoelace area of a closed polygon in model units, absolute. */
-function polygonArea(vertices: CadPoint[]): number {
-  let sum = 0;
-  for (let i = 0; i < vertices.length; i++) {
-    const a = vertices[i];
-    const b = vertices[(i + 1) % vertices.length];
-    sum += a.x * b.y - b.x * a.y;
-  }
-  return Math.abs(sum) / 2;
-}
-
-/**
  * Draw a polygon (SOLID / 3DFACE / expanded solid hatch).
  *
- * **Monochrome fills substantial regions light grey and strokes the outline;
- * color mode also paints the fill in the DWG's own colour.**
- * Reusing the stroke colour as an opaque fill is wrong in monochrome:
- * `strokeColor` returns `#000000` for every entity there, and `resolveColorHex`
- * additionally rewrites near-white to black, so any solid hatch, `Solid` or
- * leader arrowhead filled solid black regardless of the colour the DWG gave it.
- * A single large filled region — a slab, a floor finish, a highlighted material
- * — then painted over a third of the sheet and buried the line work under it.
+ * **Colour mode paints the fill opaquely in the DWG's own colour** — that is
+ * what the source drawing specifies, so a solid hatch, a filled region or a
+ * leader arrowhead lands on the PNG exactly as AutoCAD fills it.
  *
- * Monochrome therefore fills in `MONOCHROME_HIGHLIGHT_FILL` rather than black, and
- * only above `MONOCHROME_HIGHLIGHT_MIN_AREA_FRACTION` of the sheet, so highlights
- * still read as highlights without greying the drawing. Anything below that
- * threshold is stroke-only, which is what keeps arrowheads black and crisp.
- *
- * In color mode the DWG's own colour is kept, and a region the DWG marks as
- * filled is painted at `HIGHLIGHT_FILL_OPACITY`: that is what makes a highlight
- * (a coloured hatch, a marked-up material) read as a highlight in the PNG
- * instead of collapsing into the surrounding line work. The opacity keeps the
- * line work beneath it visible. `entity.filled` still records the DWG's own fill
- * intent (see `Entity.filled`), so nothing is lost from the model.
+ * **Monochrome renders line work only**: the outline is stroked and nothing is
+ * filled. Reusing the stroke colour as an opaque fill would paint `#000000`
+ * over the line work and bury it (a light-grey "highlight" fill used to sit
+ * between the two; it was removed once colour rendering became the product).
  */
 function renderSolid(ctx: RenderContext, entity: Extract<Entity, { type: "SOLID" }>): string {
   if (entity.vertices.length < 3) {
@@ -800,37 +849,19 @@ function renderSolid(ctx: RenderContext, entity: Extract<Entity, { type: "SOLID"
   }
   const points = entity.vertices.map((v) => px(v, ctx)).map((p) => `${p.x},${p.y}`).join(" ");
   const color = strokeColor(ctx, entity);
-  const paint =
-    entity.filled &&
-    (ctx.colorMode === "color" || isSubstantialFilledRegion(ctx, entity));
-  const fill =
-    ctx.colorMode === "color" ? (paint ? color : "none") : paint ? MONOCHROME_HIGHLIGHT_FILL : "none";
-  const opacity = paint && ctx.colorMode === "color" ? ` fill-opacity="${HIGHLIGHT_FILL_OPACITY}"` : "";
-  return `<polygon points="${points}" fill="${fill}"${opacity} stroke="${color}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"/>`;
+  const fill = ctx.colorMode === "color" && entity.filled ? color : "none";
+  return `<polygon points="${points}" fill="${fill}" stroke="${color}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"${strokeDash(ctx, entity)}/>`;
 }
 
 /**
- * Whether a filled region is big enough to read as a highlight rather than as
- * line work. Compares its area against the drawing's own extent so the answer
- * does not depend on the sheet's units; see
- * `MONOCHROME_HIGHLIGHT_MIN_AREA_FRACTION`.
+ * Frame for a RasterImage placeholder (the image's pixels are external to the
+ * DWG, so only the placement quadrilateral can be drawn).
+ *
+ * Outline only, in the entity's own colour — no fill. A light-grey fill here
+ * was the last grey box on a colour sheet: with the drawing's real colours in
+ * use, a grey patch over the paper reads as a stray highlight rather than as
+ * an image.
  */
-function isSubstantialFilledRegion(ctx: RenderContext, entity: Extract<Entity, { type: "SOLID" }>): boolean {
-  const sheetWidth = ctx.bounds.maxX - ctx.bounds.minX;
-  const sheetHeight = ctx.bounds.maxY - ctx.bounds.minY;
-  const sheetArea = sheetWidth * sheetHeight;
-  // A degenerate sheet (a zero-extent span, a single point) has no meaningful
-  // area to compare against. Treat the region as substantial so it is not
-  // silently dropped — the fill is light and cannot bury the line work.
-  if (!Number.isFinite(sheetArea) || sheetArea <= 0) {
-    return true;
-  }
-  return polygonArea(entity.vertices) / sheetArea >= MONOCHROME_HIGHLIGHT_MIN_AREA_FRACTION;
-}
-
-/** Light fill for RasterImage placeholder frames (the actual pixels are external to the DWG). */
-const IMAGE_PLACEHOLDER_FILL = "#e5e7eb";
-
 function renderImage(ctx: RenderContext, entity: Extract<Entity, { type: "IMAGE" }>): string {
   if (entity.vertices.length < 3) {
     return "";
@@ -839,8 +870,7 @@ function renderImage(ctx: RenderContext, entity: Extract<Entity, { type: "IMAGE"
     .map((v) => px(v, ctx))
     .map((p) => `${p.x},${p.y}`)
     .join(" ");
-  const width = Math.max(1, ctx.minStrokePx);
-  return `<polygon points="${points}" fill="${IMAGE_PLACEHOLDER_FILL}" stroke="${strokeColor(ctx, entity)}" stroke-width="${width}" stroke-linejoin="round"/>`;
+  return `<polygon points="${points}" fill="none" stroke="${strokeColor(ctx, entity)}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"/>`;
 }
 
 /**
@@ -873,9 +903,16 @@ function renderText(ctx: RenderContext, entity: Extract<Entity, { type: "TEXT" |
   const anchor =
     entity.alignment.horizontal === "center" ? "middle" : entity.alignment.horizontal === "right" ? "end" : "start";
   const baseline = round(p.y + baselineShift(entity, fontSize, block.lines.length));
-  const dy = round(MTEXT_LINE_PITCH * fontSize);
+  const spacing = mtextLineSpacing(entity);
+  const dy = round(MTEXT_LINE_PITCH * spacing * fontSize);
+  // An interior blank line is a real row: it is inked as a non-breaking space
+  // so the `dy` advance applies — an empty tspan emits no text and some
+  // rasterizers then skip its offset, collapsing the rows below it.
   const tspans = block.lines
-    .map((line, index) => `<tspan x="${p.x}" dy="${index === 0 ? 0 : dy}">${escapeXml(line)}</tspan>`)
+    .map((line, index) => {
+      const ink = line.length > 0 ? escapeXml(line) : "\u00a0";
+      return `<tspan x="${p.x}" dy="${index === 0 ? 0 : dy}">${ink}</tspan>`;
+    })
     .join("");
 
   // Transforms are combined in one `transform` attribute: an oblique DWG angle
@@ -904,7 +941,17 @@ function renderText(ctx: RenderContext, entity: Extract<Entity, { type: "TEXT" |
       ? ""
       : ` textLength="${round(block.width * ctx.viewport.scale * inflation)}" lengthAdjust="spacingAndGlyphs"`;
 
-  return `<text x="${p.x}" y="${baseline}" font-family="${escapeAttr(ctx.fontFamily)}" font-size="${fontSize}" text-anchor="${anchor}" fill="${strokeColor(ctx, entity)}"${textLength}${transform}>${tspans}</text>`;
+  // The DWG's own face: a style mapped to Arial Narrow or a bold face renders
+  // as that family, falling back to the deployment default when the style is a
+  // SHX stroke font or an unmapped name. `xml:space` keeps the leading and
+  // interior whitespace the drawing's indentation depends on — SVG collapses
+  // it otherwise.
+  const family = entity.fontFamily
+    ? `${escapeAttr(entity.fontFamily)}, ${ctx.fontFamily}`
+    : escapeAttr(ctx.fontFamily);
+  const weight = entity.fontBold ? ' font-weight="700"' : "";
+  const italic = entity.fontItalic ? ' font-style="italic"' : "";
+  return `<text x="${p.x}" y="${baseline}" font-family="${family}" font-size="${fontSize}" text-anchor="${anchor}" fill="${strokeColor(ctx, entity)}"${weight}${italic} xml:space="preserve"${textLength}${transform}>${tspans}</text>`;
 }
 
 /**
@@ -919,7 +966,7 @@ function renderText(ctx: RenderContext, entity: Extract<Entity, { type: "TEXT" |
  * still refers to the same edge of the block.
  */
 function baselineShift(entity: Extract<Entity, { type: "TEXT" | "MTEXT" }>, fontSize: number, lineCount: number): number {
-  const blockHeight = (lineCount - 1) * MTEXT_LINE_PITCH * fontSize;
+  const blockHeight = (lineCount - 1) * MTEXT_LINE_PITCH * mtextLineSpacing(entity) * fontSize;
   switch (entity.alignment.vertical) {
     case "top":
       return 0.8 * fontSize;

@@ -17,6 +17,14 @@ interface EntityBase {
   /** Raw DWG lineweight value in 1/100 mm (see LineWeightType). */
   lineWeight: number;
   lineType?: string;
+  /**
+   * Resolved dash pattern of the effective linetype, in drawing units
+   * (already multiplied by the entity's linetype scale). Positive dash /
+   * negative gap lengths as the DWG defines them; absent for Continuous and
+   * for entities with no usable pattern. The renderer turns this into a
+   * scaled `stroke-dasharray`.
+   */
+  dashPattern?: number[];
   /** Original DWG entity class name (for reporting). */
   sourceType: string;
   /**
@@ -92,6 +100,12 @@ export interface TextEntity extends EntityBase {
   widthFactor?: number;
   /** DWG oblique angle in radians (ACAD `obliqueAngle`), defaults to 0. */
   oblique?: number;
+  /** CSS font stack derived from the DWG text style's TTF face, when resolvable. */
+  fontFamily?: string;
+  /** The DWG text style marks the face bold. */
+  fontBold?: boolean;
+  /** The DWG text style marks the face italic. */
+  fontItalic?: boolean;
 }
 
 export interface MTextEntity extends EntityBase {
@@ -102,20 +116,30 @@ export interface MTextEntity extends EntityBase {
   text: string;
   width: number;
   alignment: TextAlignment;
+  /**
+   * DWG paragraph line-spacing factor (`MTEXT.lineSpacing`): 1.0 means one
+   * line of text, larger values spread the lines. Absent or non-positive
+   * falls back to 1 in `mtextLineSpacing`.
+   */
+  lineSpacing?: number;
+  /** CSS font stack derived from the DWG text style's TTF face, when resolvable. */
+  fontFamily?: string;
+  /** The DWG text style marks the face bold. */
+  fontBold?: boolean;
+  /** The DWG text style marks the face italic. */
+  fontItalic?: boolean;
 }
 
 /**
  * A polygon: maps DWG SOLID / 3DFACE entities, solid hatch boundaries and
  * leader arrowheads.
  *
- * `filled` records the DWG's own fill intent, so the model stays faithful to
- * the source. In color mode (`COLOR_MODE=color`) the renderer paints it in the
- * DWG's own colour at low opacity, because that is what makes a highlight read
- * as a highlight. In monochrome — the default — it paints it light grey, but only
- * when the region covers a meaningful share of the sheet; every entity strokes
- * `#000000` there, so honouring the flag indiscriminately filled whole regions
- * solid black and buried the line work, and it turned arrowheads into grey
- * blobs. See `renderSolid` in `renderer.ts`.
+ * `filled` records the DWG's own fill intent, so the model stays faithful to the
+ * source. In colour mode (`COLOR_MODE=color`, the default) the renderer paints it
+ * opaquely in the DWG's own colour, exactly as AutoCAD fills it. In monochrome
+ * nothing is filled — every entity strokes `#000000` there, so honouring the flag
+ * would fill whole regions solid black and bury the line work; the outline is
+ * stroked instead. See `renderSolid` in `renderer.ts`.
  */
 export interface SolidEntity extends EntityBase {
   type: "SOLID";
@@ -146,20 +170,3 @@ export type Entity =
   | MTextEntity
   | SolidEntity
   | ImageEntity;
-
-export const SUPPORTED_ENTITY_TYPES: ReadonlySet<Entity["type"]> = new Set([
-  "LINE",
-  "CIRCLE",
-  "ARC",
-  "POINT",
-  "ELLIPSE",
-  "POLYLINE",
-  "SOLID",
-  "TEXT",
-  "MTEXT",
-  "IMAGE",
-]);
-
-export function isSupportedEntity(entity: Entity): boolean {
-  return SUPPORTED_ENTITY_TYPES.has(entity.type);
-}

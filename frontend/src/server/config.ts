@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { DEFAULT_MAX_TEXT_CAP_PX, DEFAULT_MIN_TEXT_CAP_PX } from "./services/textMetrics";
+import { DEFAULT_MIN_TEXT_CAP_PX } from "./services/textMetrics";
 
 export interface AppConfig {
   maxFileSizeBytes: number;
@@ -42,6 +42,10 @@ export interface AppConfig {
    * floor in play, text size is exactly `entity.height × scale` and nothing
    * upstream bounds it, so a single mis-scaled height renders as type tens of
    * times larger than the sheet.
+   *
+   * `0` (the default, i.e. `MAX_TEXT_CAP_PX` unset) means auto: the renderer
+   * applies its tuned default and additionally hard-guards the value against
+   * the canvas height, so even an explicit override can never outgrow the sheet.
    */
   maxTextCapPx: number;
   /**
@@ -76,6 +80,17 @@ export interface AppConfig {
   modelClusterGapFraction: number;
   /** Recursion ceiling for model-space clustering. */
   modelClusterMaxDepth: number;
+  /**
+   * Cut model space into one tightly-fitted PNG per drawing cluster.
+   *
+   * Off by default: model space renders as a single PNG of the whole drawing's
+   * extents, which is what one expects from "the model view" — a set of
+   * disconnected crops silently omits the space between them and renumbers
+   * "Model" into "Model 2", "Model 3" … Clustering stays available as an
+   * opt-in (`MODEL_CLUSTER_CROPS=true`) for deployments that want zoomed
+   * per-drawing crops; the gap and depth settings above tune it.
+   */
+  modelClusterCrops: boolean;
   cleanupAgeMs: number;
   /**
    * How long a staged inbound DWG may linger before the sweep reclaims it.
@@ -209,7 +224,7 @@ export function getConfig(): AppConfig {
     // median annotation is millimetres tall and scales to a fraction of a pixel,
     // so without a floor the text is present in the SVG but invisible in the PNG.
     minTextCapPx: parsePositiveInt(process.env.MIN_TEXT_CAP_PX, DEFAULT_MIN_TEXT_CAP_PX),
-    maxTextCapPx: parsePositiveInt(process.env.MAX_TEXT_CAP_PX, DEFAULT_MAX_TEXT_CAP_PX),
+    maxTextCapPx: parsePositiveInt(process.env.MAX_TEXT_CAP_PX, 0),
     strictTextScale: (process.env.STRICT_TEXT_SCALE ?? "true").trim().toLowerCase() !== "false",
     pngSupersample: parsePositiveInt(process.env.PNG_SUPERSAMPLE, 2),
     minStrokePx: parsePositiveFloat(process.env.MIN_STROKE_PX, 1),
@@ -218,6 +233,7 @@ export function getConfig(): AppConfig {
     blankSheetInkFraction: parsePositiveFloat(process.env.BLANK_SHEET_INK_FRACTION, 0.005),
     modelClusterGapFraction: parsePositiveFloat(process.env.MODEL_CLUSTER_GAP_FRACTION, 0.03),
     modelClusterMaxDepth: parsePositiveInt(process.env.MODEL_CLUSTER_MAX_DEPTH, 12),
+    modelClusterCrops: (process.env.MODEL_CLUSTER_CROPS ?? "").trim().toLowerCase() === "true",
     cleanupAgeMs: parsePositiveInt(process.env.CLEANUP_AGE_MINUTES, 30 * 24 * 60) * 60 * 1000,
     uploadAgeMs: parsePositiveInt(process.env.UPLOAD_AGE_MINUTES, 60) * 60 * 1000,
     tempRootDir,

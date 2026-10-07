@@ -87,7 +87,3 @@ export function worldToPixel(
 export function pointToPixel(point: CadPoint, bounds: Bounds, viewport: Viewport): PixelPoint {
   return worldToPixel(point.x, point.y, bounds, viewport);
 }
-
-export function distanceToPixels(worldDistance: number, viewport: Viewport): number {
-  return worldDistance * viewport.scale;
-}

@@ -1,4 +1,4 @@
-import type { Color, Entity, Layer } from "@node-projects/acad-ts";
+import type { Color, Entity, Layer, TextStyle } from "@node-projects/acad-ts";
 import {
   Line,
   Circle,
@@ -34,6 +34,7 @@ import {
   UnderlayDisplayFlags,
   RasterImage,
   LayerFlags,
+  FontFlags,
 } from "@node-projects/acad-ts";
 import type { CadPoint, Entity as ModelsEntity, TextAlignment } from "../models/entity";
 import { DEFAULT_TEXT_HEIGHT } from "./textMetrics";
@@ -236,16 +237,24 @@ export function cssHexFromColor(color: Color | null | undefined): string {
   }
 }
 
-/** Resolve the effective color to a CSS hex string; white strokes become black. */
+/**
+ * Resolve the effective color to a CSS hex string, keeping the DWG's own RGB.
+ *
+ * The one exception is ACI index 7: AutoCAD's contextual "white/black" colour
+ * resolves to white, which is invisible on the white sheet. AutoCAD itself
+ * prints it black on white paper, so it — and only it — is remapped. Every
+ * other colour, including true-color near-whites such as `rgb(248,246,176)`,
+ * is emitted exactly as the drawing defines it.
+ */
 function resolveColorHex(color: Color): string {
   const rgb = color.getRgb();
   if (!Array.isArray(rgb) || rgb.length < 3 || rgb.slice(0, 3).some((v) => !Number.isFinite(v))) {
     return "#000000";
   }
-  const [r, g, b] = rgb;
-  if (r >= 240 && g >= 240 && b >= 240) {
+  if (!color.isTrueColor && color.index === 7) {
     return "#000000";
   }
+  const [r, g, b] = rgb;
   const hex = (v: number) => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, "0");
   return `#${hex(r)}${hex(g)}${hex(b)}`;
 }
@@ -286,6 +295,96 @@ export function entityLineWeightValue(entity: Entity): number {
     return entity.getActiveLineWeightType();
   } catch {
     return entity.lineWeight;
+  }
+}
+
+/**
+ * Regular TrueType faces DWG text styles reference, keyed by the file stem in
+ * lower case. SHX stroke fonts (`romans.shx`, `txt.shx`, `hztxt.shx`, …) are
+ * deliberately absent: they are line-art fonts with no installed counterpart,
+ * so they stay on the renderer's default face.
+ */
+const TTF_FONTS: Record<string, string> = {
+  arial: "Arial",
+  arialn: "Arial Narrow",
+  calibri: "Calibri",
+  cambria: "Cambria",
+  candara: "Candara",
+  comic: "Comic Sans MS",
+  consola: "Consolas",
+  cour: "Courier New",
+  georgia: "Georgia",
+  impact: "Impact",
+  segoeui: "Segoe UI",
+  tahoma: "Tahoma",
+  times: "Times New Roman",
+  trebuc: "Trebuchet MS",
+  verdana: "Verdana",
+  webdings: "Webdings",
+  wingdings: "Wingdings",
+  garamond: "Garamond",
+  // "Swiss" is the classic Helvetica naming (Swiss 721 = Helvetica).
+  swisscl: "Helvetica",
+};
+
+/**
+ * Turn a DWG text style into CSS font properties for the label.
+ *
+ * Every font the drawing actually asks for — Arial Narrow schedules, Calibri
+ * notes, bold title-block names — was collapsing onto one generic default
+ * face, which changes both the look and the width of every label. The style's
+ * TTF filename resolves to a real CSS family, its Bold/Italic bits (read by
+ * acad-ts from the style's ACAD extended data) map to weight and style, and a
+ * suffix variant such as `arialbd` resolves to its base family plus the
+ * matching attribute even when the bits are absent.
+ *
+ * Unmapped families and SHX fonts resolve to `undefined` and fall through to
+ * the default face — a wrong family is worse than a neutral one.
+ */
+function textFaceProps(entity: TextEntity | MText): {
+  fontFamily?: string;
+  fontBold?: boolean;
+  fontItalic?: boolean;
+} {
+  try {
+    const style = entity.style as TextStyle | null;
+    if (!style) {
+      return {};
+    }
+    const basename = (style.filename ?? "").split(/[\\/]/).pop() ?? "";
+    const stem = basename.replace(/\.[^.]+$/, "").toLowerCase();
+    const stripped = stem.replace(/(bd|bi|bold|italic|it|b|i|z)$/, "");
+    const base = TTF_FONTS[stem] ? stem : TTF_FONTS[stripped] ? stripped : null;
+    const flags = Number(style.trueType) || 0;
+    const variant = base !== null && base !== stem;
+    return {
+      fontFamily: base === null ? undefined : TTF_FONTS[base],
+      fontBold:
+        (flags & FontFlags.Bold) !== 0 || (variant && /(?:bd|bi|bold|b|z)$/.test(stem))
+          ? true
+          : undefined,
+      fontItalic:
+        (flags & FontFlags.Italic) !== 0 || (variant && /(?:bi|it|italic|z)$/.test(stem))
+          ? true
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The text style's default horizontal character scale, consulted when the
+ * entity itself stores 0 (AutoCAD's "inherit from the style"). `undefined`
+ * when neither carries a usable value, so the model keeps its documented
+ * default of 1.
+ */
+function faceStyleWidth(entity: TextEntity | MText): number | undefined {
+  try {
+    const width = (entity.style as TextStyle | null)?.width;
+    return typeof width === "number" && Number.isFinite(width) && width > 0 ? width : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -411,6 +510,39 @@ function textEntityHeight(entity: TextEntity | MText, dimensionTextHeight?: numb
   return DEFAULT_TEXT_HEIGHT;
 }
 
+/**
+ * Resolve the entity's effective linetype (ByLayer/ByBlock already resolved)
+ * into dash-gap lengths in drawing units.
+ *
+ * Dashed line work — HIDDEN, DASHED, ISO patterns — is part of the drawing's
+ * meaning, and rendering it solid loses that. The pattern segments come from
+ * the DWG's own linetype table; zero-length segments are shape markers of
+ * complex linetypes and are dropped, since SVG dash arrays cannot draw the
+ * embedded glyphs. Returns undefined for Continuous or anything unresolvable,
+ * which renders as a plain stroke.
+ */
+function resolveDashPattern(entity: Entity): number[] | undefined {
+  try {
+    const linetype = entity.getActiveLineType();
+    const segments = linetype?.segments;
+    if (!segments || segments.length < 2) {
+      return undefined;
+    }
+    const scale =
+      Number.isFinite(entity.lineTypeScale) && entity.lineTypeScale > 0 ? entity.lineTypeScale : 1;
+    const pattern: number[] = [];
+    for (const segment of segments) {
+      const length = Math.abs(segment.length) * scale;
+      if (length > 1e-9) {
+        pattern.push(length);
+      }
+    }
+    return pattern.length >= 2 ? pattern : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function baseProps<T extends ModelsEntity["type"]>(entity: Entity, type: T) {
   return {
     type,
@@ -418,6 +550,7 @@ function baseProps<T extends ModelsEntity["type"]>(entity: Entity, type: T) {
     layer: entityLayerName(entity),
     lineWeight: entityLineWeightValue(entity),
     lineType: entity.lineType?.name ?? undefined,
+    dashPattern: resolveDashPattern(entity),
     sourceType: entity.objectName ?? type,
   };
 }
@@ -426,11 +559,13 @@ function baseProps<T extends ModelsEntity["type"]>(entity: Entity, type: T) {
  * Tessellate a NURBS spline into a dense polyline. `polygonalVertexes`
  * samples the curve in parameter space; the count is derived from the number
  * of control points so long curves stay smooth without exploding on trivial
- * ones. `tryPolygonalVertexes` degrades gracefully when the knot data is bad.
+ * ones. Splines are still the one curve type without a native path command,
+ * so the tessellation is dense — the old 512 cap left visible facets on large
+ * curves. `tryPolygonalVertexes` degrades gracefully when the knot data is bad.
  */
 function splineToPolyline(spline: Spline): ModelsEntity | null {
   const length = Math.max(spline.controlPoints.length, 2);
-  const segments = Math.max(24, Math.min(512, Math.round(length * 10)));
+  const segments = Math.max(24, Math.min(2048, Math.round(length * 10)));
   const result = spline.tryPolygonalVertexes(segments);
   if (!result.success || result.points.length < 2) {
     return null;
@@ -1176,6 +1311,7 @@ export function extractEntity(
     };
   }
   if (entity instanceof TextEntity) {
+    const face = textFaceProps(entity);
     return {
       ...baseProps(entity, "TEXT"),
       position: textPosition(entity),
@@ -1183,11 +1319,19 @@ export function extractEntity(
       height: textEntityHeight(entity, dimensionTextHeight),
       text: entity.value ?? "",
       alignment: textAlignment(entity),
-      widthFactor: entity.widthFactor,
+      // A stored width factor of 0 means "use the text style's", which is what
+      // AutoCAD falls back to; passing the raw 0 through made `textWidthFactor`
+      // discard the style's setting and draw the label at normal width.
+      widthFactor:
+        Number.isFinite(entity.widthFactor) && entity.widthFactor > 0
+          ? entity.widthFactor
+          : faceStyleWidth(entity),
       oblique: entity.obliqueAngle,
+      ...face,
     };
   }
   if (entity instanceof MText) {
+    const face = textFaceProps(entity);
     return {
       ...baseProps(entity, "MTEXT"),
       position: textPosition(entity),
@@ -1196,6 +1340,8 @@ export function extractEntity(
       text: mtextPlainText(entity.value ?? ""),
       width: entity.rectangleWidth,
       alignment: textAlignment(entity),
+      lineSpacing: Number.isFinite(entity.lineSpacing) && entity.lineSpacing > 0 ? entity.lineSpacing : undefined,
+      ...face,
     };
   }
   if (entity instanceof Spline) {

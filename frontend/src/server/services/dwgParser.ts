@@ -18,6 +18,7 @@ import {
 } from "@node-projects/acad-ts";
 import type { BlockRecord, CadDocument, Layout } from "@node-projects/acad-ts";
 import type { RawDwgData } from "./dwgReader";
+import { unitsPerMmFrom } from "../utils/lineWeight";
 import {
   extractEntity,
   extractHatch,
@@ -39,6 +40,7 @@ import {
   normalizeLayer,
 } from "./entityExtractor";
 import { drawingBounds } from "./boundsCalculator";
+import type { Bounds } from "../models/bounds";
 import type { Drawing } from "../models/drawing";
 import type { Entity } from "../models/entity";
 import type { Block } from "../models/block";
@@ -58,12 +60,6 @@ export interface ConversionStatistics {
   };
 }
 
-export interface ParsedDrawing {
-  drawing: Drawing;
-  statistics: ConversionStatistics;
-  version: string | null;
-}
-
 /** One selectable output view: the model space or a named paper-space layout. */
 export interface ParsedView {
   /** Stable id, e.g. "model" or "layout-0", recomputed deterministically. */
@@ -71,6 +67,13 @@ export interface ParsedView {
   name: string;
   isModel: boolean;
   drawing: Drawing;
+  /**
+   * Drawing units per millimetre, from the DWG header (`$INSUNITS`). Paper
+   * space shares the drawing's unit, so one value serves every view; it is
+   * what turns a physical lineweight in mm into drawing units for the
+   * renderer's plot-accurate stroke widths.
+   */
+  unitsPerMm: number;
   statistics: ConversionStatistics;
 }
 
@@ -719,11 +722,6 @@ function pageFromBlockRecord(blockRecord: BlockRecord | null, warnings: WarningC
   return { entities: pageEntities, viewports: pageViewports, bounds };
 }
 
-/** The legacy convenience page: the DWG's single paper-space block record. */
-function extractPage(document: CadDocument, warnings: WarningCollector): Page | null {
-  return pageFromBlockRecord(document.paperSpace, warnings);
-}
-
 function normalizeLayers(document: CadDocument): Layer[] {
   const layers: Layer[] = [];
   if (document.layers) {
@@ -769,6 +767,75 @@ function viewStatistics(total: number, rendered: number, warnings: WarningCollec
 }
 
 /**
+ * Plausibility window for a paper rectangle against the content it holds.
+ *
+ * Layout media settings are unreliable: real drawings claim 210×297 for a
+ * sheet whose title block is 17.5×11.6 units, mix millimetre and inch numbers
+ * within one file, and store a rotation on top. A paper rectangle is only
+ * trusted when it is the same order of magnitude as the sheet's own content —
+ * outside this window the claim is wrong and the content bounds stand alone.
+ */
+const PAPER_RATIO_MIN = 0.3;
+const PAPER_RATIO_MAX = 3;
+
+/**
+ * The layout's paper rectangle in paper-space drawing units, anchored at the
+ * origin, or null when the media claim is not credible for this content.
+ *
+ * Unit candidates: `paperWidth`/`paperHeight` come in `paperUnits`
+ * (inches/mm/pixels), but paper-space coordinates follow the drawing, which
+ * may be either — so both readings are tried, in the order the setting
+ * implies, and the first that fits the content wins. A 90°/270° plot rotation
+ * turns the media the way AutoCAD shows it, which swaps width and height.
+ */
+function layoutPaperBounds(layout: Layout, content: Bounds): Bounds | null {
+  let width = layout.paperWidth;
+  let height = layout.paperHeight;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+  const rotation = Number(layout.paperRotation) || 0;
+  if (rotation === 1 || rotation === 3) {
+    const swap = width;
+    width = height;
+    height = swap;
+  }
+  // 1 = Millimeters, 0 = Inches (PlotPaperUnits); anything else is skipped.
+  const unitScales =
+    layout.paperUnits === 1 ? [1, 1 / 25.4, 25.4] : layout.paperUnits === 0 ? [1, 25.4, 1 / 25.4] : null;
+  const span = Math.max(content.maxX - content.minX, content.maxY - content.minY);
+  if (!unitScales || !Number.isFinite(span) || span <= 0) {
+    return null;
+  }
+  for (const scale of unitScales) {
+    const w = width * scale;
+    const h = height * scale;
+    const ratio = Math.max(w, h) / span;
+    if (Number.isFinite(ratio) && ratio >= PAPER_RATIO_MIN && ratio <= PAPER_RATIO_MAX) {
+      return { minX: 0, minY: 0, maxX: w, maxY: h };
+    }
+  }
+  return null;
+}
+
+/**
+ * Union the layout's own paper rectangle into the sheet bounds.
+ *
+ * One layout becomes one PNG of the real sheet: at least the paper AutoCAD
+ * would plot onto, framed from the origin. Unioning — never replacing — is the
+ * point: content that spills past the media edge stays visible instead of
+ * being cropped away, while a sparse sheet still gets its paper bounds rather
+ * than shrinking to whatever ink happens to exist.
+ */
+function includeLayoutPaper(page: Page, layout: Layout): void {
+  const paper = layoutPaperBounds(layout, page.bounds);
+  if (!paper) {
+    return;
+  }
+  page.bounds = includeRect(page.bounds, paper.minX, paper.minY, paper.maxX, paper.maxY);
+}
+
+/**
  * Enumerate the paper-space layouts as selectable views. Names come from the
  * DWG's ACAD_LAYOUT table (e.g. "Model 1", "Model 2"); each sheet is the
  * border/title block plus the viewport windows onto the model. Layouts without
@@ -780,7 +847,8 @@ function paperSpaceViews(
   warnings: WarningCollector,
   model: NormalizedModel,
   layers: Layer[],
-  blocks: Block[]
+  blocks: Block[],
+  unitsPerMm: number
 ): ParsedView[] {
   const views: ParsedView[] = [];
   const layouts: Layout[] = document.layouts
@@ -797,11 +865,13 @@ function paperSpaceViews(
       if (!page) {
         continue;
       }
+      includeLayoutPaper(page, layout);
       views.push({
         viewId: `layout-${seen}`,
         name: layout.name,
         isModel: false,
         drawing: { entities: model.entities, bounds: page.bounds, layers, blocks, page },
+        unitsPerMm,
         statistics: {
           ...viewStatistics(model.total, model.rendered, warnings),
           page: { entityCount: page.entities.length, viewportCount: page.viewports.length },
@@ -820,6 +890,7 @@ function paperSpaceViews(
       name: legacyPaperName(document) ?? "Layout 1",
       isModel: false,
       drawing: { entities: model.entities, bounds: page.bounds, layers, blocks, page },
+      unitsPerMm,
       statistics: {
         ...viewStatistics(model.total, model.rendered, warnings),
         page: { entityCount: page.entities.length, viewportCount: page.viewports.length },
@@ -855,6 +926,7 @@ export function parseViews(raw: RawDwgData): ViewsResult {
   const blocks: Block[] = [];
   const model = normalizeModelSpace(document, warnings);
   const modelBounds = drawingBounds(model.entities);
+  const unitsPerMm = unitsPerMmFrom(document.header?.insUnits, document.header?.measurementUnits);
 
   const views: ParsedView[] = [];
   if (modelBounds) {
@@ -863,43 +935,14 @@ export function parseViews(raw: RawDwgData): ViewsResult {
       name: "Model",
       isModel: true,
       drawing: { bounds: modelBounds, entities: model.entities, layers, blocks },
+      unitsPerMm,
       statistics: viewStatistics(model.total, model.rendered, warnings),
     });
   }
-  pushAll(views, paperSpaceViews(document, warnings, model, layers, blocks));
+  pushAll(views, paperSpaceViews(document, warnings, model, layers, blocks, unitsPerMm));
 
   if (views.length === 0) {
     throw new Error("No drawable model space content was found in this drawing.");
   }
   return { views, version: raw.version ?? null };
-}
-
-/** Convert a DWG into the single normalized drawing (legacy pipeline entry). */
-export function parseDwg(raw: RawDwgData): ParsedDrawing {
-  const document = raw.document;
-  const warnings = new WarningCollector();
-  const layers = normalizeLayers(document);
-  const blocks: Block[] = [];
-  const model = normalizeModelSpace(document, warnings);
-  const page = extractPage(document, warnings);
-
-  const bounds = drawingBounds(model.entities);
-  if (!bounds && !page) {
-    throw new Error("No drawable model space content was found in this drawing.");
-  }
-
-  return {
-    drawing: {
-      bounds: bounds ?? page!.bounds,
-      entities: model.entities,
-      layers,
-      blocks,
-      page: page ?? undefined,
-    },
-    statistics: {
-      ...viewStatistics(model.total, model.rendered, warnings),
-      ...(page ? { page: { entityCount: page.entities.length, viewportCount: page.viewports.length } } : {}),
-    },
-    version: raw.version ?? null,
-  };
 }
