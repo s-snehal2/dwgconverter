@@ -37,7 +37,7 @@ interface EntityBase {
    * the value keeps its own `sourceType` of "MTEXT". Two things need the origin
    * to behave correctly: dimension text must fall back to the dimension style's
    * text height instead of a generic drawing-unit default, and arrowheads must
-   * not be mistaken for filled highlights. Set by `expandDimensionBlock`.
+   * not be mistaken for ordinary geometry. Set by `expandDimensionBlock`.
    */
   fromDimension?: boolean;
 }
@@ -132,20 +132,13 @@ export interface MTextEntity extends EntityBase {
 
 /**
  * A polygon: maps DWG SOLID / 3DFACE entities, solid hatch boundaries and
- * leader arrowheads.
- *
- * `filled` records the DWG's own fill intent, so the model stays faithful to the
- * source. In colour mode (`COLOR_MODE=color`, the default) the renderer paints it
- * opaquely in the DWG's own colour, exactly as AutoCAD fills it. In monochrome
- * nothing is filled — every entity strokes `#000000` there, so honouring the flag
- * would fill whole regions solid black and bury the line work; the outline is
- * stroked instead. See `renderSolid` in `renderer.ts`.
+ * leader arrowheads. Always rendered outline-only — the interior is never
+ * filled (see `renderSolid` in `renderer.ts`).
  */
 export interface SolidEntity extends EntityBase {
   type: "SOLID";
   /** 3 or 4 corner points (in model space). */
   vertices: CadPoint[];
-  filled: boolean;
 }
 
 /**

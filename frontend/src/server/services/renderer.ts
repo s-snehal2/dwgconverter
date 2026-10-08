@@ -834,14 +834,11 @@ function renderPoint(ctx: RenderContext, entity: Extract<Entity, { type: "POINT"
 /**
  * Draw a polygon (SOLID / 3DFACE / expanded solid hatch).
  *
- * **Colour mode paints the fill opaquely in the DWG's own colour** — that is
- * what the source drawing specifies, so a solid hatch, a filled region or a
- * leader arrowhead lands on the PNG exactly as AutoCAD fills it.
- *
- * **Monochrome renders line work only**: the outline is stroked and nothing is
- * filled. Reusing the stroke colour as an opaque fill would paint `#000000`
- * over the line work and bury it (a light-grey "highlight" fill used to sit
- * between the two; it was removed once colour rendering became the product).
+ * Line work only: the outline is stroked in the entity's own colour and the
+ * interior is never filled, in colour mode or monochrome alike. Filled areas
+ * painted solid grey patches over the paper, which read as stray highlights
+ * rather than as the drawing; the outline preserves every boundary the source
+ * drawing defines.
  */
 function renderSolid(ctx: RenderContext, entity: Extract<Entity, { type: "SOLID" }>): string {
   if (entity.vertices.length < 3) {
@@ -849,18 +846,15 @@ function renderSolid(ctx: RenderContext, entity: Extract<Entity, { type: "SOLID"
   }
   const points = entity.vertices.map((v) => px(v, ctx)).map((p) => `${p.x},${p.y}`).join(" ");
   const color = strokeColor(ctx, entity);
-  const fill = ctx.colorMode === "color" && entity.filled ? color : "none";
-  return `<polygon points="${points}" fill="${fill}" stroke="${color}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"${strokeDash(ctx, entity)}/>`;
+  return `<polygon points="${points}" fill="none" stroke="${color}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"${strokeDash(ctx, entity)}/>`;
 }
 
 /**
  * Frame for a RasterImage placeholder (the image's pixels are external to the
  * DWG, so only the placement quadrilateral can be drawn).
  *
- * Outline only, in the entity's own colour — no fill. A light-grey fill here
- * was the last grey box on a colour sheet: with the drawing's real colours in
- * use, a grey patch over the paper reads as a stray highlight rather than as
- * an image.
+ * Outline only, in the entity's own colour — no fill, so the frame stays a
+ * neutral placeholder rather than a grey box over the paper.
  */
 function renderImage(ctx: RenderContext, entity: Extract<Entity, { type: "IMAGE" }>): string {
   if (entity.vertices.length < 3) {

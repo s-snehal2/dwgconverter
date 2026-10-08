@@ -247,13 +247,13 @@ export function getConfig(): AppConfig {
     // cache does not consume a generation. 0 = unlimited.
     aiGenerationLimit: parseNonNegativeInt(process.env.AI_GENERATION_LIMIT, 3),
     geminiTimeoutMs: parsePositiveInt(process.env.GEMINI_TIMEOUT_MS, 240_000),
-    tilesviewApiUrl: (process.env.TILESVIEW_API_URL ?? "https://tilesview.ai/Provider/app/api-room-planner-data").trim(),
+    tilesviewApiUrl: (process.env.TILESVIEW_API_URL ?? "https://visualiser.classicmarble.com//Provider/app/api-room-planner-data").trim(),
     tilesviewAppKey: (process.env.TILESVIEW_APP_KEY ?? "").trim(),
     tilesviewAppSecret: (process.env.TILESVIEW_APP_SECRET ?? "").trim(),
     tilesviewAppKeyHeader: (process.env.TILESVIEW_APP_KEY_HEADER ?? "app_key").trim(),
     tilesviewAppSecretHeader: (process.env.TILESVIEW_APP_SECRET_HEADER ?? "app_secret").trim(),
     tilesviewVisualizerBaseUrl: (
-      process.env.TILESVIEW_VISUALIZER_BASE_URL ?? "https://tilesview.ai/app/EZEnoscu4lODABbT_sHm7Q/visualizer"
+      process.env.TILESVIEW_VISUALIZER_BASE_URL ?? "https://visualiser.classicmarble.com/app/EZEnoscu4lODABbT_sHm7Q/visualizer"
     ).trim().replace(/\/+$/, ""),
   };
 }

@@ -674,7 +674,7 @@ export function extractHatch(hatch: Hatch): ModelsEntity[] {
     const last = cleaned[cleaned.length - 1];
     const closedLoop =
       Math.abs(first.x - last.x) < 1e-9 && Math.abs(first.y - last.y) < 1e-9 ? cleaned : [...cleaned, first];
-    loops.push({ ...base, sourceType: "HATCH", type: "SOLID", vertices: closedLoop, filled: true });
+    loops.push({ ...base, sourceType: "HATCH", type: "SOLID", vertices: closedLoop });
   }
   return loops;
 }
@@ -738,7 +738,6 @@ export function extractLeader(leader: Leader): ModelsEntity[] {
   const arrowhead: ModelsEntity = {
     ...baseProps(leader, "SOLID"),
     vertices: [left, tip, right],
-    filled: true,
   };
   return [polyline, arrowhead];
 }
@@ -856,7 +855,6 @@ export function extractTolerance(tolerance: Tolerance): ModelsEntity[] {
       { x: center.x + halfW, y: center.y + halfH },
       { x: center.x - halfW, y: center.y + halfH },
     ],
-    filled: false,
   };
   const label: ModelsEntity = {
     ...baseProps(tolerance, "TEXT"),
@@ -901,7 +899,7 @@ function unfilledPolygon(source: Entity, vertices: CadPoint[]): ModelsEntity | n
   if (vertices.length < 3) {
     return null;
   }
-  return { ...baseProps(source, "SOLID"), vertices, filled: false };
+  return { ...baseProps(source, "SOLID"), vertices };
 }
 
 /** Faces of a sub-D MESH (`faces` index into `vertices`). */
@@ -1222,7 +1220,6 @@ export function extractWallRect(wall: Wall): ModelsEntity | null {
       { x: e.x - px, y: e.y - py },
       { x: s.x - px, y: s.y - py },
     ],
-    filled: false,
   };
 }
 
@@ -1352,14 +1349,14 @@ export function extractEntity(
     if (vertices.length < 3) {
       return null;
     }
-    return { ...baseProps(entity, "SOLID"), vertices, filled: true };
+    return { ...baseProps(entity, "SOLID"), vertices };
   }
   if (entity instanceof Face3D) {
     const vertices = solidVertices([entity.firstCorner, entity.secondCorner, entity.thirdCorner, entity.fourthCorner]);
     if (vertices.length < 3) {
       return null;
     }
-    return { ...baseProps(entity, "SOLID"), vertices, filled: false };
+    return { ...baseProps(entity, "SOLID"), vertices };
   }
   if (entity instanceof RasterImage) {
     // The DWG references an external image file whose pixels are not part of

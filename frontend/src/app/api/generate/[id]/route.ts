@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import sharp from "sharp";
 import { getConfig } from "@/server/config";
 import { computeAiPairId, promptHash, readAiPair, saveAiPair } from "@/server/services/aiPairCache";
 import { composeAiPrompt, generateDrawingImage } from "@/server/services/geminiImage";
@@ -204,8 +205,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   try {
     log(`Sending ${id}.png (${png.byteLength} bytes) to Gemini for AI generation.`);
 
-    const { image, durationMs } = await generateDrawingImage(png, config);
-    log(`Gemini returned AI image (${image.byteLength} bytes) in ${durationMs}ms.`);
+    const { image: rawImage, durationMs } = await generateDrawingImage(png, config);
+    const image = await ensurePng(rawImage);
+    log(`Gemini returned AI image (${rawImage.byteLength} bytes, stored as PNG ${image.byteLength} bytes) in ${durationMs}ms.`);
 
     const fileName = `${baseName}-ai.png`;
     await saveAiOutput(id, image, fileName);
@@ -291,6 +293,22 @@ function errorResponse(code: ErrorCode) {
     { success: false, error: userMessageForCode(code) },
     { status: httpStatusForCode(code) },
   );
+}
+
+/**
+ * Re-encode the Gemini result to a true PNG. Gemini returns JPEG bytes, which
+ * every layer of this app then calls `.png` — TilesView, the download route's
+ * `image/png` header and the Supabase content type all depend on the bytes
+ * actually being PNG. A failure here is cosmetic: fall back to the original
+ * bytes rather than failing a generation that already succeeded.
+ */
+async function ensurePng(image: Buffer): Promise<Buffer> {
+  try {
+    return await sharp(image).png().toBuffer();
+  } catch (err) {
+    log(`PNG re-encode failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return image;
+  }
 }
 
 export async function GET() {
