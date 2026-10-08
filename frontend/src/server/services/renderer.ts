@@ -6,17 +6,7 @@ import { entityBounds } from "./boundsCalculator";
 import { projectEntityToPage } from "./viewportMapper";
 import { mapLineWeightToPixels } from "../utils/lineWeight";
 import { arcFromBulge, arcSpan, radToDeg, TAU } from "../utils/geometry";
-import {
-  DEFAULT_MAX_TEXT_CAP_PX,
-  DEFAULT_MIN_TEXT_CAP_PX,
-  MTEXT_LINE_PITCH,
-  TEXT_CAP_HEIGHT_RATIO,
-  mtextLineSpacing,
-  textBlockSize,
-  textEntityBounds,
-  textHeight,
-  textWidthFactor,
-} from "./textMetrics";
+import { textEntityBounds } from "./textMetrics";
 
 export interface RenderOptions {
   colorMode: "monochrome" | "color";
@@ -31,19 +21,6 @@ export interface RenderOptions {
    */
   unitsPerMm?: number;
   /**
-   * Smallest cap height, in output pixels, any label may be drawn at. Defaults to
-   * `DEFAULT_MIN_TEXT_CAP_PX`; overridable per render via `MIN_TEXT_CAP_PX`.
-   */
-  minTextCapPx?: number;
-  /**
-   * Largest cap height, in output pixels, any label may be drawn at. Defaults to
-   * `DEFAULT_MAX_TEXT_CAP_PX`; overridable via `MAX_TEXT_CAP_PX`. Applies in
-   * both strict and non-strict modes — see `DEFAULT_MAX_TEXT_CAP_PX` for why a
-   * ceiling is needed even once the floor is off.
-   */
-  maxTextCapPx?: number;
-  fontFamily?: string;
-  /**
    * Oversample factor for higher-quality anti-aliasing. The SVG is emitted at
    * this many times the target pixel size and then downscaled by the PNG
    * generator; a value of 1 (or undefined) renders at exact size.
@@ -55,8 +32,6 @@ export interface RenderOptions {
    * for sharp to rasterize quickly.
    */
   lite?: boolean;
-  /** If true, do not apply minimum text cap height floor (strict DWG scale). */
-  strictTextScale?: boolean;
 }
 
 /** Cap on the model entities projected through any one viewport in lite mode. */
@@ -87,10 +62,7 @@ interface RenderContext {
   colorMode: "monochrome" | "color";
   minStrokePx: number;
   unitsPerMm: number;
-  fontFamily: string;
   bounds: Drawing["bounds"];
-  minTextCapPx: number;
-  maxTextCapPx: number;
 }
 
 /** Axis-aligned bounding box in model coordinates. */
@@ -309,9 +281,9 @@ export function renderToSvg(drawing: Drawing, options: RenderOptions): string {
 
 function buildContext(bounds: Drawing["bounds"], options: RenderOptions): RenderContext {
   // A non-finite size or margin would make computeViewport return a NaN scale,
-  // which propagates into every emitted coordinate and font-size as the literal
-  // "NaN". Rasterizers skip those attributes silently, so the sheet would come
-  // out with no text and no error. Coerce to usable numbers instead.
+  // which propagates into every emitted coordinate as the literal "NaN".
+  // Rasterizers skip those attributes silently, so the sheet would come out
+  // empty with no error. Coerce to usable numbers instead.
   const maxWidth = Number.isFinite(options.maxWidth) && options.maxWidth > 0 ? options.maxWidth : 1024;
   const maxHeight = Number.isFinite(options.maxHeight) && options.maxHeight > 0 ? options.maxHeight : 1024;
   const margin = Number.isFinite(options.margin) ? options.margin : 0;
@@ -320,27 +292,12 @@ function buildContext(bounds: Drawing["bounds"], options: RenderOptions): Render
     maxHeight,
     margin: Math.max(0, margin),
   });
-  // `MAX_TEXT_CAP_PX` absent or 0 means auto: the tuned default cap, and in
-  // every case a hard guard of the canvas itself so a runaway height can never
-  // outgrow the sheet it is drawn on.
-  const configuredCap =
-    Number.isFinite(options.maxTextCapPx) && (options.maxTextCapPx as number) > 0
-      ? (options.maxTextCapPx as number)
-      : DEFAULT_MAX_TEXT_CAP_PX;
   return {
     viewport,
     colorMode: options.colorMode,
     minStrokePx: options.minStrokePx ?? 1,
     unitsPerMm: Number.isFinite(options.unitsPerMm) && (options.unitsPerMm as number) > 0 ? (options.unitsPerMm as number) : 1,
-    fontFamily: options.fontFamily ?? getDefaultFont(),
     bounds,
-    minTextCapPx:
-      options.strictTextScale ?? true
-        ? -Infinity
-        : Number.isFinite(options.minTextCapPx) && (options.minTextCapPx as number) > 0
-          ? (options.minTextCapPx as number)
-          : DEFAULT_MIN_TEXT_CAP_PX,
-    maxTextCapPx: Math.min(configuredCap, Math.max(1, viewport.canvasHeight / 2)),
   };
 }
 
@@ -361,20 +318,6 @@ function backgroundRect(canvasWidth: number, canvasHeight: number): string {
   return `<rect x="0" y="0" width="${canvasWidth}" height="${canvasHeight}" fill="#ffffff"/>`;
 }
 
-const EMBEDDED_FONT_FAMILY = "Dwg Sans";
-
-function deploymentBaseUrl(): string {
-  const url = (process.env.VERCEL_URL ?? "").trim();
-  return url ? `https://${url}` : "";
-}
-
-function fontFaceStyle(): string {
-  const base = deploymentBaseUrl();
-  return base
-    ? `<style>@font-face{font-family:"${EMBEDDED_FONT_FAMILY}";src:url("${base}/fonts/Roboto-Regular.ttf") format("truetype");}</style>`
-    : "";
-}
-
 function renderModelToSvg(drawing: Drawing, options: RenderOptions): string {
   const ctx = buildContext(drawing.bounds, options);
   const supersample = resolveSupersample(options.supersample ?? 1, ctx.viewport.canvasWidth, ctx.viewport.canvasHeight);
@@ -384,7 +327,6 @@ function renderModelToSvg(drawing: Drawing, options: RenderOptions): string {
   const parts: string[] = [
     svgHeader(canvasWidth, canvasHeight),
     backgroundRect(canvasWidth, canvasHeight),
-    fontFaceStyle(),
     ...(supersample > 1 ? [`<g transform="scale(${supersample})">`] : []),
     "<g>",
   ];
@@ -403,7 +345,6 @@ function renderPageToSvg(drawing: Drawing, options: RenderOptions): string {
   const parts: string[] = [
     svgHeader(canvasWidth, canvasHeight),
     backgroundRect(canvasWidth, canvasHeight),
-    fontFaceStyle(),
     ...(supersample > 1 ? [`<g transform="scale(${supersample})">`] : []),
   ];
 
@@ -502,7 +443,7 @@ const ENTITY_PASSES: Array<Entity["type"]> = [
   "MTEXT",
 ];
 
-/** Render entities in the established z-order (solid shapes before text). */
+/** Render entities in the established z-order (solid shapes last-wins over lines). */
 function renderEntities(ctx: RenderContext, entities: Entity[], parts: string[]): void {
   for (const pass of ENTITY_PASSES) {
     for (const entity of entities) {
@@ -534,7 +475,11 @@ function renderEntity(ctx: RenderContext, entity: Entity): string[] {
       return [renderPoint(ctx, entity)];
     case "TEXT":
     case "MTEXT":
-      return [renderText(ctx, entity)];
+      // Text is parsed but never drawn: converted sheets are line work only,
+      // so labels, dimension values and title-block strings leave no glyphs in
+      // the PNG. The entities stay in the model for AI notes and viewport
+      // scoping; this is the single point where they stop becoming ink.
+      return [];
   }
 }
 
@@ -865,129 +810,4 @@ function renderImage(ctx: RenderContext, entity: Extract<Entity, { type: "IMAGE"
     .map((p) => `${p.x},${p.y}`)
     .join(" ");
   return `<polygon points="${points}" fill="none" stroke="${strokeColor(ctx, entity)}" stroke-width="${strokeWidth(ctx, entity)}" stroke-linejoin="round"/>`;
-}
-
-/**
- * Draw one label at its true DWG size.
- *
- * With `STRICT_TEXT_SCALE` on (the default) `ctx.minTextCapPx` is `-Infinity`,
- * so this is exactly `textHeight(entity) * scale` — a label the source drawing
- * makes 0.4px tall renders 0.4px tall. With it off, the floor applies and small
- * annotations are inflated until they are legible; see `DEFAULT_MIN_TEXT_CAP_PX`
- * in textMetrics for what that trades away.
- *
- * `ctx.maxTextCapPx` bounds the result from above in both modes. Without it the
- * strict path had no limit at all, and `viewport.scale` is unbounded, so a single
- * bad entity height would render a label larger than the sheet.
- */
-function renderText(ctx: RenderContext, entity: Extract<Entity, { type: "TEXT" | "MTEXT" }>): string {
-  // `textBlockSize` owns line splitting and MTEXT wrapping so the emitted
-  // tspans, the entity bounds and the viewport culler all agree on how many
-  // lines there are and how wide the block is.
-  const block = textBlockSize(entity);
-  if (block.lines.length === 0) {
-    return "";
-  }
-  const p = px(entity.position, ctx);
-  const capHeightPx = Math.min(
-    Math.max(textHeight(entity) * ctx.viewport.scale, ctx.minTextCapPx),
-    ctx.maxTextCapPx
-  );
-  const fontSize = round(capHeightPx / TEXT_CAP_HEIGHT_RATIO);
-  const anchor =
-    entity.alignment.horizontal === "center" ? "middle" : entity.alignment.horizontal === "right" ? "end" : "start";
-  const baseline = round(p.y + baselineShift(entity, fontSize, block.lines.length));
-  const spacing = mtextLineSpacing(entity);
-  const dy = round(MTEXT_LINE_PITCH * spacing * fontSize);
-  // An interior blank line is a real row: it is inked as a non-breaking space
-  // so the `dy` advance applies — an empty tspan emits no text and some
-  // rasterizers then skip its offset, collapsing the rows below it.
-  const tspans = block.lines
-    .map((line, index) => {
-      const ink = line.length > 0 ? escapeXml(line) : "\u00a0";
-      return `<tspan x="${p.x}" dy="${index === 0 ? 0 : dy}">${ink}</tspan>`;
-    })
-    .join("");
-
-  // Transforms are combined in one `transform` attribute: an oblique DWG angle
-  // leans the glyphs (skewX about the baseline origin), and a rotated label is
-  // turned about its own baseline start so the anchor stays put.
-  const transforms: string[] = [];
-  if (entity.type === "TEXT" && entity.oblique) {
-    transforms.push(`skewX(${round(-radToDeg(entity.oblique) * 100) / 100})`);
-  }
-  if (entity.rotation) {
-    transforms.push(`rotate(${round(-radToDeg(entity.rotation) * 100) / 100} ${p.x} ${baseline})`);
-  }
-  const transform = transforms.length > 0 ? ` transform="${transforms.join(" ")}"` : "";
-
-  // A DWG widthFactor stretches glyphs horizontally. `textLength` reproduces it
-  // from the same metric the bounds use, so the ink fills the reserved box. When
-  // the legibility floor inflated the label, that reserved box is still at true
-  // model scale, so it is widened by the same ratio: squeezing a 7px label into
-  // a 0.11px-wide box would crush the glyphs into an unreadable sliver, which is
-  // exactly the failure the floor exists to prevent.
-  const widthFactor = textWidthFactor(entity);
-  const naturalCapPx = textHeight(entity) * ctx.viewport.scale;
-  const inflation = naturalCapPx > 0 ? capHeightPx / naturalCapPx : 1;
-  const textLength =
-    widthFactor === 1
-      ? ""
-      : ` textLength="${round(block.width * ctx.viewport.scale * inflation)}" lengthAdjust="spacingAndGlyphs"`;
-
-  // The DWG's own face: a style mapped to Arial Narrow or a bold face renders
-  // as that family, falling back to the deployment default when the style is a
-  // SHX stroke font or an unmapped name. `xml:space` keeps the leading and
-  // interior whitespace the drawing's indentation depends on — SVG collapses
-  // it otherwise.
-  const family = entity.fontFamily
-    ? `${escapeAttr(entity.fontFamily)}, ${ctx.fontFamily}`
-    : escapeAttr(ctx.fontFamily);
-  const weight = entity.fontBold ? ' font-weight="700"' : "";
-  const italic = entity.fontItalic ? ' font-style="italic"' : "";
-  return `<text x="${p.x}" y="${baseline}" font-family="${family}" font-size="${fontSize}" text-anchor="${anchor}" fill="${strokeColor(ctx, entity)}"${weight}${italic} xml:space="preserve"${textLength}${transform}>${tspans}</text>`;
-}
-
-/**
- * Offset from the CAD anchor to the SVG baseline.
- *
- * SVG positions text by its baseline, but a CAD anchor may be the top, middle
- * or bottom of the text box. Pixel Y grows downwards, so those anchors shift
- * the baseline down (top) or up (bottom) from the anchor point. The fractions
- * are the usual cap-height / x-height / descent ratios of a sans-serif face;
- * `dominant-baseline` would be tidier but is not uniformly supported by SVG
- * rasterizers. For multi-line blocks the whole block is shifted so the anchor
- * still refers to the same edge of the block.
- */
-function baselineShift(entity: Extract<Entity, { type: "TEXT" | "MTEXT" }>, fontSize: number, lineCount: number): number {
-  const blockHeight = (lineCount - 1) * MTEXT_LINE_PITCH * mtextLineSpacing(entity) * fontSize;
-  switch (entity.alignment.vertical) {
-    case "top":
-      return 0.8 * fontSize;
-    case "middle":
-      return 0.35 * fontSize - blockHeight / 2;
-    case "bottom":
-      return -0.2 * fontSize - blockHeight;
-    default:
-      return 0;
-  }
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function escapeAttr(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-}
-
-function getDefaultFont(): string {
-  return deploymentBaseUrl()
-    ? `${EMBEDDED_FONT_FAMILY}, Segoe UI, Arial, Helvetica, sans-serif`
-    : "Segoe UI, Arial, Helvetica, sans-serif";
 }

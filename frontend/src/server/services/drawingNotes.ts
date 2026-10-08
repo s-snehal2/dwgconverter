@@ -6,10 +6,10 @@ import { textBlockSize, textHeight } from "./textMetrics";
 /**
  * Collects the text a DWG actually contains, as a plain list of strings.
  *
- * Not an AI input: the image model sees the rendered PNG and nothing else. This
- * is the expected-set half of the `AUDIT_TEXT=1` fidelity check in
- * `textCoverage.ts`, which asks whether every string a sheet is supposed to show
- * survived into the SVG and survived at a legible size.
+ * Converted sheets no longer render glyphs, so this records what the source
+ * drawing *says* — the text still exists in the parsed model even though it
+ * never reaches the PNG. Not an AI input: the image model sees the rendered
+ * PNG and nothing else.
  */
 
 export interface DrawingNote {

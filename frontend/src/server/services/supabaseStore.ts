@@ -179,6 +179,30 @@ export async function removeObjects(keys: string[]): Promise<number> {
   return keys.length;
 }
 
+/**
+ * Mint a signed upload URL for one object.
+ *
+ * The browser PUTs the raw bytes straight to Supabase with no auth headers
+ * (the token lives in the URL), so bodies beyond the platform's ~4.5 MB
+ * request cap never pass through this function — only the tiny JSON envelope
+ * does. The signed token is valid for two hours.
+ *
+ * The object is transient by contract: a DWG staged under `uploads/` is
+ * deleted by the convert route's `finally` as soon as the conversion attempt
+ * finishes, and the `uploads/` retention sweep is the backstop if the request
+ * dies between upload and convert.
+ */
+export async function createSignedUploadUrl(key: string): Promise<string> {
+  const { data, error } = await client().storage.from(supabaseBucket()).createSignedUploadUrl(key);
+  if (error) {
+    throw storageAppError(error);
+  }
+  if (!data?.signedUrl) {
+    throw storageAppError(new Error("Supabase returned no signed upload URL."));
+  }
+  return data.signedUrl;
+}
+
 export interface StoredObjectAge {
   /** Full bucket-relative key, ready to hand back to `removeObjects`. */
   key: string;

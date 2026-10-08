@@ -12,10 +12,12 @@ import { convertDwgFile } from "@/services/api";
 
 /**
  * Client-side cap for the file picker. The server enforces its own
- * `MAX_FILE_SIZE_MB` and is the real authority; in practice the platform's
- * request-body limit (~4.5 MB) bites long before this number does.
+ * `MAX_FILE_SIZE_MB` and is the real authority; 40 MB also keeps every object
+ * under Supabase's 50 MB free-tier object limit. Files up to this cap go
+ * straight to storage, so the platform's ~4.5 MB request-body cap only ever
+ * applies to the JSON envelopes and the local-dev fallback path.
  */
-const FALLBACK_MAX_MB = 80;
+const MAX_FILE_MB = 40;
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
@@ -29,7 +31,7 @@ export default function Home() {
   const [results, setResults] = useState<ConversionResultData[] | null>(null);
   const [omittedBlankSheets, setOmittedBlankSheets] = useState<OmittedSheet[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  const maxMb = FALLBACK_MAX_MB;
+  const maxMb = MAX_FILE_MB;
   const abortRef = useRef<AbortController | null>(null);
 
   // Async continuations (conversion promise resolution) must not touch React

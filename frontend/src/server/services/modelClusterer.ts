@@ -54,6 +54,11 @@ export function clusterModelEntities(
 ): ModelCluster[] {
   const boxed = entities
     .map((entity): Boxed | null => {
+      // Labels are never rendered, so they must not pull the crop or split a
+      // drawing: cluster on line work only.
+      if (entity.type === "TEXT" || entity.type === "MTEXT") {
+        return null;
+      }
       const bounds = entityBounds(entity);
       return boundsAreValid(bounds) ? { entity, bounds } : null;
     })

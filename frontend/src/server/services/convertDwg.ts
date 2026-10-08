@@ -3,7 +3,6 @@ import { parseViews, type ConversionStatistics, type ParsedView } from "./dwgPar
 import { renderToSvg, type RenderOptions } from "./renderer";
 import { generatePng, rasterInkFraction } from "./pngGenerator";
 
-import { auditSheetTextCoverage } from "./textCoverage";
 import { partitionRenderable, type OmittedSheet } from "./blankSheet";
 import {
   clusterModelEntities,
@@ -229,10 +228,7 @@ export async function renderViewPng(
       margin: config.marginPx,
       minStrokePx: config.minStrokePx,
       unitsPerMm: view.unitsPerMm,
-      minTextCapPx: config.minTextCapPx,
-      maxTextCapPx: config.maxTextCapPx,
       supersample: supersampleForEntities(view.drawing.entities.length, config.pngSupersample),
-      strictTextScale: config.strictTextScale,
     };
     const svg = renderToSvg(view.drawing, options);
     const png = await generatePng(svg, {
@@ -241,33 +237,6 @@ export async function renderViewPng(
     });
     const renderDurationMs = Date.now() - renderStart;
     logger.info?.(`Rendered SVG and generated PNG (${png.byteLength} bytes) in ${renderDurationMs}ms.`);
-    // Opt-in fidelity audit. It answers the question a PNG cannot: did every
-    // string this sheet is supposed to show survive into the SVG, and did it
-    // survive at a legible size? Cheap next to rendering, so it is left off by
-    // default and switched on per deployment.
-    if ((process.env.AUDIT_TEXT ?? "").trim() === "1") {
-      try {
-        const report = auditSheetTextCoverage(view.drawing, svg, {
-          sheetName: view.name,
-          isModel: view.isModel,
-          // With strict scale on there is no floor in the render, so the audit
-          // must not judge against one either.
-          minCapHeightPx: config.strictTextScale ? 0 : config.minTextCapPx,
-        });
-        logger.info?.(
-          `Text audit "${report.sheet}": ${report.present}/${report.expected} strings` +
-            ` (${(report.coverage * 100).toFixed(1)}%), minCap=${report.minCapHeightPx.toFixed(2)}px,` +
-            ` belowFloor=${report.belowFloor}, invalid=${report.invalid} -> ${report.ok ? "PASS" : "FAIL"}` +
-            (report.missing.length > 0 ? `; missing: ${report.missing.slice(0, 10).join(", ")}` : "")
-        );
-      } catch (auditErr) {
-        logger.info?.(
-          `Text audit "${view.name}" failed to run: ${
-            auditErr instanceof Error ? auditErr.message : String(auditErr)
-          }`
-        );
-      }
-    }
     return {
       png,
       statistics: view.statistics,

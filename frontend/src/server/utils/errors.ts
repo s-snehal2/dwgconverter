@@ -18,6 +18,7 @@ export type ErrorCode =
   | "AI_GENERATION_ERROR"
   | "AI_LIMIT_REACHED"
   | "FILE_NOT_FOUND"
+  | "UPLOAD_EXPIRED"
   | "DOWNLOAD_ERROR"
   | "RATE_LIMITED"
   | "STORAGE_UNAVAILABLE"
@@ -50,6 +51,7 @@ const USER_MESSAGES: Record<ErrorCode, string> = {
   AI_GENERATION_ERROR: "The AI image could not be generated. Please try again.",
   AI_LIMIT_REACHED: "You've reached the maximum of {limit} AI generations for this drawing.",
   FILE_NOT_FOUND: "The requested conversion result no longer exists.",
+  UPLOAD_EXPIRED: "Your upload is no longer available. Please upload the file again.",
   DOWNLOAD_ERROR: "The PNG could not be downloaded.",
   RATE_LIMITED: "Too many requests. Please try again shortly.",
   STORAGE_UNAVAILABLE: "The storage service is temporarily unavailable. Please try again later.",
@@ -75,6 +77,7 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "NO_DRAWABLE_CONTENT":
       return 422;
     case "FILE_NOT_FOUND":
+    case "UPLOAD_EXPIRED":
       return 404;
     case "AI_NOT_CONFIGURED":
     case "STORAGE_UNAVAILABLE":

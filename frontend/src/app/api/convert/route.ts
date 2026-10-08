@@ -6,7 +6,8 @@ import { sweepExpiredOutputsThrottled, saveOutput } from "@/server/services/outp
 
 import { validateExtension, validateFileSize, validateDwgSignature } from "@/server/utils/fileValidation";
 import { toAppError, userMessageForCode, httpStatusForCode } from "@/server/utils/errors";
-import { newConversionId } from "@/server/utils/storage";
+import { newConversionId, isSafeConversionId } from "@/server/utils/storage";
+import { getObject, removeObjects } from "@/server/services/supabaseStore";
 import { sha256Hex } from "@/server/utils/hash";
 import { clientIpFrom, takeRateLimit } from "@/server/utils/rateLimit";
 
@@ -52,7 +53,9 @@ interface IncomingDwg {
   originalFileName: string;
 }
 
-type IntakeResult = { ok: true; dwg: IncomingDwg } | { ok: false; response: Response };
+type IntakeResult =
+  | { ok: true; dwg: IncomingDwg; stagedKey?: string }
+  | { ok: false; response: Response };
 
 /**
  * Intake — multipart/form-data with a `file` field.
@@ -99,12 +102,118 @@ async function readMultipartDwg(request: NextRequest, config: AppConfig): Promis
   };
 }
 
+/** Bucket key for a staged upload id minted by `POST /api/upload`. */
+function stagedUploadKey(uploadId: string): string {
+  return `uploads/${uploadId}.dwg`;
+}
+
+/** Best-effort delete of a staged upload; the retention sweep is the backstop. */
+async function deleteStagedUpload(key: string): Promise<void> {
+  try {
+    await removeObjects([key]);
+    log(`Deleted staged upload ${key}.`);
+  } catch (err) {
+    log(
+      `Staged upload cleanup failed: ${err instanceof Error ? err.message : String(err)}; the retention sweep will remove it.`
+    );
+  }
+}
+
+/**
+ * Exact ArrayBuffer for a Buffer's contents. Node buffers can be pooled views
+ * into a larger ArrayBuffer, so the view's own window must be sliced out
+ * before it is handed to the converter.
+ */
+function toArrayBuffer(bytes: Buffer): ArrayBuffer {
+  const pooled = bytes.buffer as ArrayBuffer;
+  if (bytes.byteOffset === 0 && bytes.byteLength === pooled.byteLength) {
+    return pooled;
+  }
+  return pooled.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+/**
+ * Intake — JSON body with an `uploadId` whose DWG bytes the browser already
+ * pushed straight to Supabase Storage via `POST /api/upload`.
+ *
+ * The staged object is downloaded and validated exactly like a multipart
+ * upload: size cap and DWG signature are checked against the real bytes, not
+ * the client's claims. Every failure path after the download deletes the
+ * object immediately; on success the key is handed back to the caller, which
+ * deletes it in a `finally` once conversion finishes. Nothing here persists
+ * the DWG beyond this request.
+ */
+async function readStagedDwg(request: NextRequest, config: AppConfig): Promise<IntakeResult> {
+  let body: { uploadId?: unknown; fileName?: unknown; size?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return { ok: false, response: errorResponse("INVALID_FILE") };
+  }
+
+  const uploadId = typeof body.uploadId === "string" ? body.uploadId : "";
+  const fileName = typeof body.fileName === "string" ? body.fileName : "";
+  const size = typeof body.size === "number" ? body.size : Number.NaN;
+
+  // UUID shape from `newConversionId()`; anything else is rejected before it
+  // can be spliced into an object key.
+  if (!isSafeConversionId(uploadId)) {
+    return { ok: false, response: errorResponse("INVALID_FILE") };
+  }
+  const extensionCheck = validateExtension(fileName);
+  if (!extensionCheck.ok) {
+    return { ok: false, response: errorResponse(extensionCheck.error.code) };
+  }
+  const sizeCheck = validateFileSize(size, config.maxFileSizeBytes);
+  if (!sizeCheck.ok) {
+    return { ok: false, response: errorResponse(sizeCheck.error.code) };
+  }
+
+  const key = stagedUploadKey(uploadId);
+  let bytes: Buffer | null;
+  try {
+    bytes = await getObject(key);
+  } catch (err) {
+    log(`Staged upload read failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false, response: errorResponse(toAppError(err).code) };
+  }
+  if (!bytes) {
+    return { ok: false, response: errorResponse("UPLOAD_EXPIRED") };
+  }
+
+  // The client-reported size only gated the mint; the bytes are authoritative.
+  if (bytes.byteLength > config.maxFileSizeBytes) {
+    await deleteStagedUpload(key);
+    return { ok: false, response: errorResponse("FILE_TOO_LARGE") };
+  }
+  const sigCheck = validateDwgSignature(bytes.subarray(0, 32));
+  if (!sigCheck.ok) {
+    await deleteStagedUpload(key);
+    return { ok: false, response: errorResponse(sigCheck.error.code) };
+  }
+
+  return {
+    ok: true,
+    dwg: { buffer: toArrayBuffer(bytes), originalFileName: fileName },
+    stagedKey: key,
+  };
+}
+
 /**
  * POST /api/convert
  *
- * Accepts multipart/form-data with a `file` field. Converts a DWG into one PNG
- * per paper-space layout sheet (or the model space when there are no layouts)
- * and responds with a `sheets` array of self-contained ConversionResult objects.
+ * Accepts two shapes:
+ *  - multipart/form-data with a `file` field (small files and local dev):
+ *    parsed in-process and never written anywhere;
+ *  - `{ uploadId, fileName, size }` (the normal path for files up to
+ *    `MAX_FILE_SIZE_MB`): the DWG was already pushed straight to Supabase
+ *    Storage, so this only downloads the staged object — the JSON envelope
+ *    stays far below the platform's request-body cap either way.
+ *
+ * Converts a DWG into one PNG per paper-space layout sheet (or the model
+ * space when there are no layouts) and responds with a `sheets` array of
+ * self-contained ConversionResult objects. A staged DWG is deleted before
+ * this function returns, success or failure.
  */
 export async function POST(request: NextRequest) {
   const config = getConfig();
@@ -113,10 +222,14 @@ export async function POST(request: NextRequest) {
     return errorResponse("RATE_LIMITED");
   }
 
-  const intake = await readMultipartDwg(request, config);
+  const contentType = request.headers.get("content-type") ?? "";
+  const intake = contentType.includes("application/json")
+    ? await readStagedDwg(request, config)
+    : await readMultipartDwg(request, config);
   if (!intake.ok) {
     return intake.response;
   }
+  const stagedKey = intake.stagedKey ?? null;
 
   // Sweep only once intake has succeeded, so rejected or malformed requests
   // never pay for a bucket scan. The pass covers `outputs/`, the legacy
@@ -225,6 +338,13 @@ export async function POST(request: NextRequest) {
       { success: false, error: message },
       { status }
     );
+  } finally {
+    // A staged DWG lives only for the duration of this request: deleted here
+    // on every path, with the `uploads/` retention sweep as the backstop if
+    // this function dies before the finally can run.
+    if (stagedKey) {
+      await deleteStagedUpload(stagedKey);
+    }
   }
 }
 

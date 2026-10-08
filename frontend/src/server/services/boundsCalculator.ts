@@ -183,6 +183,12 @@ export function drawingBounds(entities: Entity[]): Bounds | null {
   }
   let bounds: Bounds | null = null;
   for (const entity of entities) {
+    // Text is parsed but never rendered, so its glyph extents must not pad the
+    // fit: the frame hugs the line work alone. Per-entity `entityBounds` still
+    // measures labels for viewport culling and AI-note scoping.
+    if (entity.type === "TEXT" || entity.type === "MTEXT") {
+      continue;
+    }
     const box = entityBounds(entity);
     if (bounds === null) {
       bounds = box;
