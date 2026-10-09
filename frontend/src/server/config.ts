@@ -253,7 +253,7 @@ export function getConfig(): AppConfig {
     tilesviewAppKeyHeader: (process.env.TILESVIEW_APP_KEY_HEADER ?? "app_key").trim(),
     tilesviewAppSecretHeader: (process.env.TILESVIEW_APP_SECRET_HEADER ?? "app_secret").trim(),
     tilesviewVisualizerBaseUrl: (
-      process.env.TILESVIEW_VISUALIZER_BASE_URL ?? "https://visualiser.classicmarble.com/app/EZEnoscu4lODABbT_sHm7Q/visualizer"
+      process.env.TILESVIEW_VISUALIZER_BASE_URL ?? "https://visualiser.classicmarble.com/app/W4-vCC2IPm9bBWI_UVskjA/visualizer"
     ).trim().replace(/\/+$/, ""),
   };
 }

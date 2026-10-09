@@ -35,8 +35,20 @@ const LIST_MAX_PAGES = 50;
 /** Objects deleted per request, well under Supabase's per-call array limit. */
 const REMOVE_CHUNK_SIZE = 100;
 
+function envValue(name: string): string {
+  const raw = (process.env[name] ?? "").trim();
+  if (raw.length >= 2) {
+    const first = raw[0];
+    const last = raw[raw.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return raw.slice(1, -1).trim();
+    }
+  }
+  return raw;
+}
+
 export function supabaseUrl(): string {
-  return (process.env.SUPABASE_URL ?? "").trim();
+  return envValue("SUPABASE_URL");
 }
 
 /**
@@ -45,11 +57,11 @@ export function supabaseUrl(): string {
  * from a browser, so a leaked copy cannot be used client-side.
  */
 export function supabaseSecretKey(): string {
-  return (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  return envValue("SUPABASE_SERVICE_ROLE_KEY");
 }
 
 export function supabaseBucket(): string {
-  return (process.env.SUPABASE_STORAGE_BUCKET ?? "").trim() || DEFAULT_BUCKET;
+  return envValue("SUPABASE_STORAGE_BUCKET") || DEFAULT_BUCKET;
 }
 
 export function isSupabaseEnabled(): boolean {
